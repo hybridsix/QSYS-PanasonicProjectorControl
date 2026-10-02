@@ -1,6 +1,6 @@
 {
   "name": "qsys-panasonic-projector-control",
-  "version": "0.1.0",
+  "version": "0.1.5",
   "description": "Q-SYS plugin for Panasonic PT-REQ80 and PT-RQ35K2 projectors",
   "private": true,
   "scripts": {

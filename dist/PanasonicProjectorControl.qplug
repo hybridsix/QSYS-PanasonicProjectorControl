@@ -15,8 +15,8 @@
 
 PluginInfo = {
   Name = "Hybridsix Software~Panasonic Projector Control",
-  Version = "0.1.0",
-  BuildVersion = "0.1.0.0",
+  Version = "0.1.5",
+  BuildVersion = "0.1.5.0",
   Id = "eb89b070-8e63-4d3d-a30a-2234f9da3fc9",
   Author = "Michael King",
   Description = "Control Panasonic PT-REQ80 and PT-RQ35K2 projectors from Q-SYS: power, input, shutter, freeze, menu and lens control over Panasonic LAN command control (TCP), with live status feedback.",
