@@ -40,6 +40,7 @@ T.test("property names are unique and defaults are valid", function()
     end
   end
   T.truthy(seen["Model"] and seen["IP Address"] and seen["Port"] and seen["Lens Speed"] and seen["Debug Print"])
+  T.truthy(seen["Normal Poll Interval (s)"] and seen["High Poll Interval (s)"] and seen["High Poll Timeout (s)"])
 end)
 
 T.test("RectifyProperties hides optional inputs of the other model", function()

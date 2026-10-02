@@ -19,13 +19,18 @@ Poller.Schedule = {
 }
 
 -- handlers[key](ok, value, raw) receives each poll result.
-function Poller.New(engine, handlers)
+function Poller.New(engine, handlers, options)
   local self = setmetatable({}, Poller)
   self.engine = engine
   self.handlers = handlers
   self.last = {}
   self.power = nil
   self.now = 0
+  self.options = {
+    HighRateInterval = (options and options.HighRateInterval) or 1,
+    HighRateTimeout = (options and options.HighRateTimeout) or 30,
+  }
+  self.highRate = nil
   return self
 end
 
@@ -37,9 +42,34 @@ function Poller:_poll(item)
   end)
 end
 
+function Poller:Boost(key, timeout)
+  if not self.engine:IsReady() then return end
+  if key then
+    self.highRate = { Key = key, Until = self.now + (timeout or self.options.HighRateTimeout) }
+  end
+end
+
+function Poller:ClearBoost()
+  self.highRate = nil
+end
+
 function Poller:Tick(now)
   self.now = now
+  if self.highRate and now > self.highRate.Until then self.highRate = nil end
   if not self.engine:IsReady() then return end
+
+  if self.highRate then
+    for _, item in ipairs(Poller.Schedule) do
+      if item.Key == self.highRate.Key then
+        local last = self.last[item.Key]
+        if last == nil or now - last >= self.options.HighRateInterval then
+          self:_poll(item)
+        end
+      end
+    end
+    return
+  end
+
   local state = self.power or "Unknown"
   for _, item in ipairs(Poller.Schedule) do
     local interval = item.Interval[state]

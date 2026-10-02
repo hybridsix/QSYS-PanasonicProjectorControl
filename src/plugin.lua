@@ -34,6 +34,9 @@ function GetProperties()
     { Name = "IP Address", Type = "string", Value = "192.168.10.100" },
     { Name = "Port", Type = "integer", Min = 1, Max = 65535, Value = 1024 },
     { Name = "Lens Speed", Type = "enum", Choices = { "Slow", "Normal", "Fast" }, Value = "Normal" },
+    { Name = "Normal Poll Interval (s)", Type = "integer", Min = 1, Max = 60, Value = 2 },
+    { Name = "High Poll Interval (s)", Type = "integer", Min = 1, Max = 10, Value = 1 },
+    { Name = "High Poll Timeout (s)", Type = "integer", Min = 5, Max = 180, Value = 30 },
   }
   -- One switch per optional input of every model; the ones that do not
   -- belong to the selected model are hidden by RectifyProperties.
@@ -79,8 +82,10 @@ function GetControls(props)
   trigger("PowerOff")
   led("PowerState")
   text("PowerText")
+  text("ProjectorState")
 
   add({ Name = "Input", ControlType = "Text", PinStyle = "Both", UserPin = true })
+  led("ShutterState")
   toggle("Shutter")
   toggle("Freeze")
 
@@ -104,6 +109,10 @@ function GetControls(props)
   text("Diag2")
   text("LastResponse")
 
+  add({ Name = "CustomCommand", ControlType = "Text", PinStyle = "Both", UserPin = true })
+  add({ Name = "CustomReply", ControlType = "Indicator", IndicatorType = "Text", PinStyle = "Output", UserPin = true })
+  trigger("CustomSend")
+
   return ctrls
 end
 
@@ -115,9 +124,9 @@ function GetControlLayout(props)
     Model = "Status~Model", Connected = "Status~Connected", IPAddress = "Status~IP Address",
     Status = "Status~Connection",
     PowerOn = "Power~On", PowerOff = "Power~Off", PowerState = "Power~State",
-    PowerText = "Power~State Text",
+    PowerText = "Power~State Text", ProjectorState = "Power~Projector State",
     Input = "Input~Select",
-    Shutter = "Image~Shutter (Image Mute)", Freeze = "Image~Freeze",
+    ShutterState = "Image~Shutter LED", Shutter = "Image~Shutter (Image Mute)", Freeze = "Image~Freeze",
     Menu = "Menu~Menu", Up = "Menu~Up", Down = "Menu~Down", Left = "Menu~Left",
     Right = "Menu~Right", Enter = "Menu~Enter", Default = "Menu~Default",
     AutoSetup = "Menu~Auto Setup",
@@ -167,7 +176,8 @@ function GetControlLayout(props)
   button("PowerOn", "Power On", 10, 145, 130, 28, { 0, 200, 220 })
   button("PowerOff", "Power Off", 145, 145, 130, 28, { 255, 140, 0 })
   control("PowerState", "Led", 290, 148, 22, 22)
-  control("PowerText", "Text", 317, 148, 140, 22)
+  control("PowerText", "Text", 317, 148, 110, 22)
+  control("ProjectorState", "Text", 432, 148, 48, 22)
 
   -- Input
   box("Input", 5, 185, 490, 55)
@@ -176,7 +186,8 @@ function GetControlLayout(props)
   -- Image
   box("Image", 5, 245, 490, 55)
   button("Shutter", "Shutter", 10, 270, 130, 26)
-  button("Freeze", "Freeze", 145, 270, 130, 26)
+  control("ShutterState", "Led", 145, 272, 18, 18)
+  button("Freeze", "Freeze", 170, 270, 130, 26)
 
   -- Menu navigation
   box("Menu", 5, 305, 240, 130)
@@ -216,6 +227,12 @@ function GetControlLayout(props)
   control("Diag2", "Text", 90, 515, 390, 22)
   label("Last Reply:", 10, 543, 75)
   control("LastResponse", "Text", 90, 541, 390, 22)
+
+  -- Raw command testing
+  box("Raw Command", 5, 570, 490, 75)
+  control("CustomCommand", "TextBox", 15, 596, 290, 24)
+  button("CustomSend", "Send", 315, 594, 70, 28, { 0, 200, 220 })
+  control("CustomReply", "Text", 395, 596, 90, 22)
 
   return layout, graphics
 end

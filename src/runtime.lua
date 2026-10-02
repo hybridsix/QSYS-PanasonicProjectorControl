@@ -17,6 +17,9 @@ return function()
   local port = Properties["Port"].Value
   local lensSpeed = Properties["Lens Speed"].Value
   local debugMode = Properties["Debug Print"].Value
+  local normalPoll = tonumber(Properties["Normal Poll Interval (s)"].Value) or 2
+  local highPoll = tonumber(Properties["High Poll Interval (s)"].Value) or 1
+  local highTimeout = tonumber(Properties["High Poll Timeout (s)"].Value) or 30
 
   local function dbg(kind, message)
     if debugMode == "All" or (debugMode == "Tx/Rx" and (kind == "tx" or kind == "rx")) then
@@ -44,6 +47,10 @@ return function()
     updating = true
     Controls.Input.String = value
     updating = false
+  end
+
+  local function setProjectorState(value)
+    setText(Controls.ProjectorState, tostring(value or "Unknown"))
   end
 
   local function detail(message)
@@ -150,13 +157,16 @@ return function()
   function handlers.power(ok, value, raw)
     if not ok then
       showPowerUnknown()
+      setProjectorState("Unknown")
       poller:SetPower(nil)
       if raw then detail("Power reply not understood: " .. raw) end
       return
     end
     setFlag(Controls.PowerState, value == "On")
     setText(Controls.PowerText, value)
+    setProjectorState(value == "On" and "On" or (value == "Standby" and "Standby" or "Unknown"))
     poller:SetPower(value)
+    if value == "On" or value == "Standby" then poller:ClearBoost() end
   end
 
   function handlers.input(ok, value, raw)
@@ -177,6 +187,7 @@ return function()
     if not ok then return end
     known.shutter = value
     setFlag(Controls.Shutter, value)
+    setFlag(Controls.ShutterState, value)
   end
 
   function handlers.freeze(ok, value)
@@ -193,7 +204,10 @@ return function()
     if ok then setText(Controls.Diag2, raw) end
   end
 
-  poller = Poller.New(engine, handlers)
+  poller = Poller.New(engine, handlers, {
+    HighRateInterval = highPoll,
+    HighRateTimeout = highTimeout,
+  })
 
   -- -------------------------------------------------------------------------
   -- Socket events
@@ -224,17 +238,29 @@ return function()
     end)
   end
 
+  local function triggerHighRate(key, timeout)
+    local delay = tonumber(timeout) or highTimeout
+    poller:Boost(key, delay)
+    poller:PollNow(key)
+  end
+
   local function pollSoon(key)
     return function(ok)
-      if ok then poller:PollNow(key) end
+      if ok then
+        triggerHighRate(key, highTimeout)
+      end
     end
   end
 
   Controls.PowerOn.EventHandler = function()
-    send("Power on", Protocol.Commands.PowerOn, pollSoon("power"))
+    send("Power on", Protocol.Commands.PowerOn, function(ok)
+      if ok then triggerHighRate("power", highTimeout) end
+    end)
   end
   Controls.PowerOff.EventHandler = function()
-    send("Power off", Protocol.Commands.PowerOff, pollSoon("power"))
+    send("Power off", Protocol.Commands.PowerOff, function(ok)
+      if ok then triggerHighRate("power", highTimeout) end
+    end)
   end
 
   for _, name in ipairs({ "Menu", "Enter", "Up", "Down", "Left", "Right", "Default" }) do
@@ -252,7 +278,13 @@ return function()
   Controls.Shutter.EventHandler = function(control)
     if updating then return end
     send("Shutter", Protocol.ShutterCommand(control.Boolean), function(ok)
-      if ok then poller:PollNow("shutter") else setFlag(Controls.Shutter, known.shutter) end
+      if ok then
+        setFlag(Controls.ShutterState, control.Boolean)
+        triggerHighRate("shutter", highTimeout)
+      else
+        setFlag(Controls.Shutter, known.shutter)
+        setFlag(Controls.ShutterState, known.shutter)
+      end
     end)
   end
 
@@ -271,7 +303,9 @@ return function()
       detail("Unknown input: " .. tostring(control.String))
       return
     end
-    send("Input", Protocol.InputCommand(code), pollSoon("input"))
+    send("Input", Protocol.InputCommand(code), function(ok)
+      if ok then triggerHighRate("input", highTimeout) end
+    end)
   end
 
   -- Lens: one move command on press, repeated while held.
@@ -302,6 +336,23 @@ return function()
     end
   end
 
+  Controls.CustomCommand.String = "QPW"
+  Controls.CustomReply.String = "Ready"
+  Controls.CustomSend.EventHandler = function()
+    local command = tostring(Controls.CustomCommand.String or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if command == "" then
+      setText(Controls.CustomReply, "Empty")
+      return
+    end
+    engine:Command("custom", { line = command, idempotent = true }, function(ok, value, raw)
+      if ok then
+        setText(Controls.CustomReply, raw or "OK")
+      else
+        setText(Controls.CustomReply, tostring(value or "Failed"))
+      end
+    end)
+  end
+
   -- -------------------------------------------------------------------------
   -- Static info and start-up
   -- -------------------------------------------------------------------------
@@ -309,6 +360,7 @@ return function()
   Controls.IPAddress.String = ip .. ":" .. tostring(port)
   Controls.Connected.Boolean = false
   showPowerUnknown()
+  setProjectorState("Unknown")
 
   local clock = 0
   local ticker = Timer.New()
