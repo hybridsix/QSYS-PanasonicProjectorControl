@@ -1,0 +1,10 @@
+# Local starter/planning bundle - not intended for GitHub
+Panasonic_QSYS_Projector_Control_Starter_2026-10-01/
+starter/
+
+# Tooling
+node_modules/
+
+# Common local/editor noise
+.DS_Store
+Thumbs.db

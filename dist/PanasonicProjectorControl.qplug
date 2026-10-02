@@ -1,0 +1,1200 @@
+PluginInfo = {
+  Name = "Panasonic~Projector Control",
+  Version = "0.1.0",
+  BuildVersion = "0.1.0.0",
+  Id = "eb89b070-8e63-4d3d-a30a-2234f9da3fc9",
+  Author = "hybridsix",
+  Description = "Control Panasonic PT-REQ80 and PT-RQ35K2 projectors over Panasonic LAN command control (TCP).",
+}
+
+
+local __modules, __loaded = {}, {}
+local function require(name)
+  local m = __loaded[name]
+  if m ~= nil then return m end
+  local f = __modules[name]
+  if not f then error("module not found: " .. name, 2) end
+  m = f(name)
+  if m == nil then m = true end
+  __loaded[name] = m
+  return m
+end
+
+__modules["engine"] = function(...)
+-- Transport state machine with a serialized command queue.
+--
+-- The engine is transport-agnostic. It is driven by:
+--   Tick(now)            called periodically (seconds, monotonic)
+--   OnConnected()        socket connected
+--   OnLine(text)         one received line
+--   OnClosed(reason)     socket closed or errored
+-- and talks to the outside through deps:
+--   send(string), connect(), disconnect(), log(kind, msg), onState(state, detail)
+--
+-- States: Disconnected, Connecting, Greeting, Ready, AuthRequired.
+-- Only one request is ever in flight. UI commands go ahead of queued polls.
+local Protocol = require("protocol")
+
+local Engine = {}
+Engine.__index = Engine
+
+Engine.Defaults = {
+  ResponseTimeout = 2.0, -- seconds to wait for a reply
+  GreetingTimeout = 2.0, -- seconds to wait for NTCONTROL before proceeding
+  ConnectTimeout = 10.0, -- seconds to wait for the socket to connect
+  MaxFailures = 3,       -- consecutive timeouts before reconnecting
+  MaxQueue = 50,
+  ReconnectMin = 5.0,    -- first reconnect delay; doubles up to ReconnectMax
+  ReconnectMax = 30.0,
+}
+
+function Engine.New(deps, options)
+  local self = setmetatable({}, Engine)
+  self.deps = deps
+  self.opt = {}
+  for k, v in pairs(Engine.Defaults) do self.opt[k] = v end
+  for k, v in pairs(options or {}) do self.opt[k] = v end
+  self.state = "Disconnected"
+  self.queue = {}
+  self.inflight = nil
+  self.failures = 0
+  self.now = 0
+  self.nextConnectAt = 0
+  self.backoff = self.opt.ReconnectMin
+  self.enabled = false
+  self.session = false
+  return self
+end
+
+function Engine:_log(kind, message)
+  if self.deps.log then self.deps.log(kind, message) end
+end
+
+function Engine:_setState(state, detail)
+  self.state = state
+  self.detail = detail
+  if self.deps.onState then self.deps.onState(state, detail) end
+end
+
+function Engine:IsReady()
+  return self.state == "Ready"
+end
+
+function Engine:Start(now)
+  self.enabled = true
+  self.now = now or self.now
+  self.nextConnectAt = self.now
+end
+
+function Engine:Stop()
+  self.enabled = false
+  if self.session then
+    self.deps.disconnect()
+    self:_closed("stopped")
+  end
+end
+
+-- ---------------------------------------------------------------------------
+-- Requests
+-- ---------------------------------------------------------------------------
+function Engine:_resolve(req, ok, value, raw)
+  if req.callback then req.callback(ok, value, raw) end
+end
+
+function Engine:_failAll(reason)
+  local pending = {}
+  if self.inflight then
+    pending[#pending + 1] = self.inflight
+    self.inflight = nil
+  end
+  for _, req in ipairs(self.queue) do pending[#pending + 1] = req end
+  self.queue = {}
+  for _, req in ipairs(pending) do self:_resolve(req, false, reason) end
+end
+
+function Engine:_enqueue(req)
+  if self.state ~= "Ready" then
+    self:_resolve(req, false, "not connected")
+    return false
+  end
+  -- A request with a key is dropped if one with the same key is pending.
+  if req.key then
+    if self.inflight and self.inflight.key == req.key then return false end
+    for _, queued in ipairs(self.queue) do
+      if queued.key == req.key then return false end
+    end
+  end
+  if #self.queue >= self.opt.MaxQueue then
+    self:_resolve(req, false, "queue full")
+    return false
+  end
+  if req.kind == "command" then
+    -- Commands go after earlier commands but ahead of queued queries.
+    local pos = 1
+    while pos <= #self.queue and self.queue[pos].kind == "command" do pos = pos + 1 end
+    table.insert(self.queue, pos, req)
+  else
+    self.queue[#self.queue + 1] = req
+  end
+  self:_dispatch()
+  return true
+end
+
+-- spec: { line = "PON", idempotent = true }
+-- callback(ok, value, raw): ok=false carries a reason string in `value`.
+function Engine:Command(key, spec, callback)
+  return self:_enqueue({
+    key = key,
+    line = spec.line,
+    kind = "command",
+    retries = spec.idempotent and 1 or 0,
+    callback = callback,
+  })
+end
+
+-- spec: { line = "QPW", parse = function(text) -> value|nil }
+function Engine:Query(key, spec, callback)
+  return self:_enqueue({
+    key = key,
+    line = spec.line,
+    parse = spec.parse,
+    kind = "query",
+    retries = 1,
+    callback = callback,
+  })
+end
+
+function Engine:_dispatch()
+  if self.state ~= "Ready" or self.inflight then return end
+  local req = table.remove(self.queue, 1)
+  if not req then return end
+  req.attempts = (req.attempts or 0) + 1
+  req.sentAt = self.now
+  self.inflight = req
+  self:_log("tx", req.line)
+  self.deps.send(Protocol.Frame(req.line))
+end
+
+function Engine:_checkTimeout()
+  local req = self.inflight
+  if not req or self.now - req.sentAt < self.opt.ResponseTimeout then return end
+  self.inflight = nil
+  self.failures = self.failures + 1
+  self:_log("warn", "timeout waiting for " .. req.line)
+  if self.failures >= self.opt.MaxFailures then
+    self:_resolve(req, false, "timeout")
+    self.deps.disconnect()
+    self:_closed("no response")
+    return
+  end
+  if req.attempts <= req.retries then
+    table.insert(self.queue, 1, req)
+  else
+    self:_resolve(req, false, "timeout")
+  end
+  self:_dispatch()
+end
+
+-- ---------------------------------------------------------------------------
+-- Connection lifecycle
+-- ---------------------------------------------------------------------------
+function Engine:_closed(reason)
+  if not self.session then return end
+  self.session = false
+  if self.state ~= "AuthRequired" then
+    self:_setState("Disconnected", reason)
+  end
+  self:_failAll(reason)
+  self.failures = 0
+  self.nextConnectAt = self.now + self.backoff
+  self:_log("info", string.format("reconnect in %.0fs (%s)", self.backoff, tostring(reason)))
+  self.backoff = math.min(self.backoff * 2, self.opt.ReconnectMax)
+end
+
+function Engine:_ready()
+  self:_setState("Ready")
+  self:_dispatch()
+end
+
+function Engine:_authRequired()
+  self:_log("warn", "projector requires authentication (command protect is on)")
+  self.backoff = self.opt.ReconnectMax
+  self:_setState("AuthRequired", "command protect enabled")
+  self.deps.disconnect()
+  self:_closed("auth required")
+end
+
+function Engine:OnConnected()
+  self.session = true
+  self.failures = 0
+  self.greetingDeadline = self.now + self.opt.GreetingTimeout
+  self:_setState("Greeting")
+end
+
+function Engine:OnClosed(reason)
+  self:_closed(reason or "closed")
+end
+
+function Engine:Tick(now)
+  self.now = now
+  local state = self.state
+  if state == "Disconnected" or state == "AuthRequired" then
+    if self.enabled and now >= self.nextConnectAt then
+      self.session = true
+      self.connectDeadline = now + self.opt.ConnectTimeout
+      self:_setState("Connecting")
+      self.deps.connect()
+    end
+  elseif state == "Connecting" then
+    if now >= self.connectDeadline then
+      self.deps.disconnect()
+      self:_closed("connect timeout")
+    end
+  elseif state == "Greeting" then
+    if now >= self.greetingDeadline then
+      self:_log("warn", "no NTCONTROL greeting; proceeding")
+      self:_ready()
+    end
+  elseif state == "Ready" then
+    self:_checkTimeout()
+    self:_dispatch()
+  end
+end
+
+-- ---------------------------------------------------------------------------
+-- Receive path
+-- ---------------------------------------------------------------------------
+function Engine:OnLine(raw)
+  local text = Protocol.Unframe(raw)
+  if text == "" then return end
+  self:_log("rx", text)
+
+  local greeting = Protocol.ParseGreeting(text)
+  if greeting then
+    if self.state == "Greeting" then
+      if greeting.protected then self:_authRequired() else self:_ready() end
+    end
+    return
+  end
+
+  local req = self.inflight
+  if not req then
+    self:_log("warn", "unsolicited reply: " .. text)
+    return
+  end
+  self.inflight = nil
+
+  -- Any reply, even an error, proves the link works.
+  self.failures = 0
+  self.backoff = self.opt.ReconnectMin
+
+  local errorCode = Protocol.ErrorCode(text)
+  if errorCode then
+    self:_resolve(req, false, errorCode, text)
+  elseif req.parse then
+    local value = req.parse(text)
+    if value == nil then
+      self:_resolve(req, false, "unexpected reply", text)
+    else
+      self:_resolve(req, true, value, text)
+    end
+  else
+    self:_resolve(req, true, nil, text)
+  end
+  self:_dispatch()
+end
+
+return Engine
+
+end
+
+__modules["models"] = function(...)
+-- Model registry plus data shared by design-time and runtime code.
+local Models = {
+  ById = {},
+  Ids = {},
+  Default = "PT-REQ80",
+}
+
+for _, id in ipairs({ "PT-REQ80", "PT-RQ35K2" }) do
+  Models.ById[id] = require("models." .. id)
+  Models.Ids[#Models.Ids + 1] = id
+end
+
+function Models.Get(id)
+  return Models.ById[id] or Models.ById[Models.Default]
+end
+
+-- Boolean plugin property that enables an optional input for a model.
+function Models.OptionalPropertyName(opt)
+  return "Show " .. opt.Label
+end
+
+-- Momentary lens controls: control name, model Lens key, direction,
+-- feature flag that gates the control.
+--
+-- UNVERIFIED: Panasonic's incremental values are documented as "+" / "-" per
+-- function. Focus and Zoom map directly to Plus / Minus. For shift, the
+-- assumption is H+ = right and V+ = up. Confirm on a real projector and flip
+-- the direction here if the lens moves the opposite way.
+Models.LensControls = {
+  { Name = "LensShiftUp", Function = "VerticalShift", Direction = 1, Feature = "LensShift" },
+  { Name = "LensShiftDown", Function = "VerticalShift", Direction = -1, Feature = "LensShift" },
+  { Name = "LensShiftLeft", Function = "HorizontalShift", Direction = -1, Feature = "LensShift" },
+  { Name = "LensShiftRight", Function = "HorizontalShift", Direction = 1, Feature = "LensShift" },
+  { Name = "FocusPlus", Function = "Focus", Direction = 1, Feature = "Focus" },
+  { Name = "FocusMinus", Function = "Focus", Direction = -1, Feature = "Focus" },
+  { Name = "ZoomPlus", Function = "Zoom", Direction = 1, Feature = "Zoom" },
+  { Name = "ZoomMinus", Function = "Zoom", Direction = -1, Feature = "Zoom" },
+}
+
+return Models
+
+end
+
+__modules["models.PT-REQ80"] = function(...)
+-- PT-REQ80 (PT-REQ15 / REQ12 family command set).
+-- Source: starter model package Panasonic_PT-REQ80_QSYS_Reference.
+-- Inputs and lens function codes come from that package; nothing here is
+-- invented. Optional SDM inputs are only offered when enabled in properties.
+return {
+  Id = "PT-REQ80",
+  Name = "Panasonic PT-REQ80",
+  Family = "REQ15/REQ12",
+  DefaultPort = 1024,
+
+  Inputs = {
+    { Label = "HDMI 1", Code = "HD1" },
+    { Label = "HDMI 2", Code = "HD2" },
+    { Label = "DisplayPort", Code = "DP1" },
+  },
+
+  OptionalInputs = {
+    { Label = "SDM 12G-SDI", Code = "DM1,SD1" },
+    { Label = "SDM DIGITAL LINK", Code = "DM1,DL1" },
+    { Label = "SDM PressIT", Code = "DM1,WP1" },
+    { Label = "SDM Third-Party", Code = "DM1,TP1" },
+    { Label = "SDM Optical 1", Code = "DM1,OP1" },
+    { Label = "SDM Optical 2", Code = "DM1,OP2" },
+  },
+
+  -- Incremental lens function codes: VXX:<code>=<value>
+  Lens = {
+    HorizontalShift = "LNSI2",
+    VerticalShift = "LNSI3",
+    Focus = "LNSI4",
+    Zoom = "LNSI5",
+  },
+
+  Features = {
+    LensShift = true,
+    Focus = true,
+    Zoom = true,
+    SelfDiagnosis = true,
+  },
+}
+
+end
+
+__modules["models.PT-RQ35K2"] = function(...)
+-- PT-RQ35K2 (RQ35K2 family command set).
+-- Source: starter model package Panasonic_PT-RQ35K2_QSYS_Reference.
+-- Optional slot-board inputs are only offered when enabled in properties.
+return {
+  Id = "PT-RQ35K2",
+  Name = "Panasonic PT-RQ35K2",
+  Family = "RQ35K2",
+  DefaultPort = 1024,
+
+  Inputs = {
+    { Label = "HDMI 1", Code = "HD1" },
+    { Label = "DIGITAL LINK", Code = "DL1" },
+  },
+
+  OptionalInputs = {
+    { Label = "Slot 1 HDMI 1", Code = "AU1,HD1" },
+    { Label = "Slot 1 HDMI 2", Code = "AU1,HD2" },
+    { Label = "Slot 1 DisplayPort 1", Code = "AU1,DP1" },
+    { Label = "Slot 1 DisplayPort 2", Code = "AU1,DP2" },
+    { Label = "Slot 1 12G-SDI 1", Code = "AU1,SD1" },
+    { Label = "Slot 1 Optical 1", Code = "AU1,OP1" },
+    { Label = "Slot 2 HDMI 3", Code = "AU2,HD3" },
+    { Label = "Slot 2 HDMI 4", Code = "AU2,HD4" },
+    { Label = "Slot 2 DisplayPort 3", Code = "AU2,DP3" },
+    { Label = "Slot 2 DisplayPort 4", Code = "AU2,DP4" },
+    { Label = "Slot 2 12G-SDI 1", Code = "AU2,SD1" },
+    { Label = "Slot 2 Optical 1", Code = "AU2,OP1" },
+  },
+
+  -- Incremental lens function codes: VXX:<code>=<value>
+  Lens = {
+    HorizontalShift = "LNSI2",
+    VerticalShift = "LNSI3",
+    Focus = "LNSI4",
+    Zoom = "LNSI5",
+  },
+
+  Features = {
+    LensShift = true,
+    Focus = true,
+    Zoom = true,
+    AutoSetup = true, -- OAS
+    SelfDiagnosis = true,
+  },
+}
+
+end
+
+__modules["poller"] = function(...)
+-- Conservative polling scheduler.
+--
+-- Intervals (seconds) depend on the last known power state:
+--   Unknown : only power is polled, until a power reply arrives
+--   Standby : only power, slowly
+--   On      : power, input, shutter, freeze, diagnostics
+local Protocol = require("protocol")
+
+local Poller = {}
+Poller.__index = Poller
+
+Poller.Schedule = {
+  { Key = "power", Interval = { On = 1, Standby = 10, Unknown = 1 } },
+  { Key = "input", Interval = { On = 2 } },
+  { Key = "shutter", Interval = { On = 2 } },
+  { Key = "freeze", Interval = { On = 3 } },
+  { Key = "diag1", Interval = { On = 5 } },
+  { Key = "diag2", Interval = { On = 5 } },
+}
+
+-- handlers[key](ok, value, raw) receives each poll result.
+function Poller.New(engine, handlers)
+  local self = setmetatable({}, Poller)
+  self.engine = engine
+  self.handlers = handlers
+  self.last = {}
+  self.power = nil
+  self.now = 0
+  return self
+end
+
+function Poller:_poll(item)
+  self.last[item.Key] = self.now
+  local handler = self.handlers[item.Key]
+  self.engine:Query(item.Key, Protocol.Queries[item.Key], function(ok, value, raw)
+    if handler then handler(ok, value, raw) end
+  end)
+end
+
+function Poller:Tick(now)
+  self.now = now
+  if not self.engine:IsReady() then return end
+  local state = self.power or "Unknown"
+  for _, item in ipairs(Poller.Schedule) do
+    local interval = item.Interval[state]
+    if interval then
+      local last = self.last[item.Key]
+      if last == nil or now - last >= interval then
+        self:_poll(item)
+      end
+    end
+  end
+end
+
+-- Poll one item as soon as possible (for example after sending a command).
+function Poller:PollNow(key)
+  if not self.engine:IsReady() then return end
+  for _, item in ipairs(Poller.Schedule) do
+    if item.Key == key then
+      self:_poll(item)
+      return
+    end
+  end
+end
+
+-- "On", "Standby" or nil (unknown). Becoming On makes everything due.
+function Poller:SetPower(state)
+  if state == self.power then return end
+  self.power = state
+  if state == "On" then
+    for _, item in ipairs(Poller.Schedule) do
+      if item.Key ~= "power" then self.last[item.Key] = nil end
+    end
+  end
+end
+
+-- Forget all timing and power state (call on disconnect).
+function Poller:Reset()
+  self.last = {}
+  self.power = nil
+end
+
+return Poller
+
+end
+
+__modules["protocol"] = function(...)
+-- Panasonic command protocol: framing, command builders, query parsers.
+--
+-- Command codes come from the supplied model reference packages. Do not add
+-- commands here unless they are verified against Panasonic documentation or a
+-- real projector.
+local Protocol = {}
+
+-- ---------------------------------------------------------------------------
+-- FRAMING - UNVERIFIED
+--
+-- The model packages list command strings (PON, QPW, ...) but not the LAN
+-- wire format. The values below are the assumed non-protect-mode format:
+-- "00" prefix, CR terminator. Everything that touches the wire goes through
+-- Frame / Unframe / ParseGreeting / ErrorCode, so correcting this after a lab
+-- capture is a change to this section only.
+-- ---------------------------------------------------------------------------
+Protocol.Framing = {
+  Prefix = "00",
+  Terminator = "\r",
+}
+
+function Protocol.Frame(command)
+  return Protocol.Framing.Prefix .. command .. Protocol.Framing.Terminator
+end
+
+-- Strip line terminators from a received line.
+function Protocol.Unframe(line)
+  return (tostring(line):gsub("[\r\n]+$", ""))
+end
+
+-- The projector greets each connection with "NTCONTROL <mode> ...".
+-- Mode 0 is assumed to mean command protect is off; anything else means
+-- authentication is required (not implemented in version 1).
+function Protocol.ParseGreeting(text)
+  local mode = text:match("^NTCONTROL%s+(%S+)")
+  if not mode then return nil end
+  return { protected = (mode ~= "0") }
+end
+
+-- Error replies (patterns assumed, confirm against a real projector). Note
+-- that diagnostic replies begin "ERRS1=" and must not match.
+function Protocol.ErrorCode(text)
+  local code = text:match("^ER(%d%d%d)$")
+  if code then return "ER" .. code end
+  code = text:match("^ERR(%w)$")
+  if code then return "ERR" .. code end
+  return nil
+end
+
+-- ---------------------------------------------------------------------------
+-- Commands (no query feedback). `idempotent` means a retry after a timeout
+-- cannot double-trigger anything.
+-- ---------------------------------------------------------------------------
+Protocol.Commands = {
+  PowerOn = { line = "PON", idempotent = true },
+  PowerOff = { line = "POF", idempotent = true },
+  Menu = { line = "OMN" },
+  Enter = { line = "OEN" },
+  Up = { line = "OCU" },
+  Down = { line = "OCD" },
+  Left = { line = "OCL" },
+  Right = { line = "OCR" },
+  Default = { line = "OST" },
+  AutoSetup = { line = "OAS" }, -- PT-RQ35K2 only; gated by Features.AutoSetup
+}
+
+-- OSH:1 engages the shutter (image blanked); OSH:0 opens it (image visible).
+-- The Q-SYS "Shutter" control follows the same sense: true = image muted.
+function Protocol.ShutterCommand(on)
+  return { line = "OSH:" .. (on and "1" or "0"), idempotent = true }
+end
+
+function Protocol.FreezeCommand(on)
+  return { line = "OFZ:" .. (on and "1" or "0"), idempotent = true }
+end
+
+function Protocol.InputCommand(code)
+  return { line = "IIS:" .. code, idempotent = true }
+end
+
+-- Incremental lens movement: VXX:<function>=<signed value>.
+-- Slow+ 00000, Slow- 00001, Normal+ 00100, Normal- 00101, Fast+ 00200,
+-- Fast- 00201.
+Protocol.LensSpeed = { Slow = 0, Normal = 100, Fast = 200 }
+
+function Protocol.LensCommand(functionCode, direction, speed)
+  local base = Protocol.LensSpeed[speed] or Protocol.LensSpeed.Normal
+  local value = base + (direction < 0 and 1 or 0)
+  return { line = string.format("VXX:%s=+%05d", functionCode, value) }
+end
+
+-- ---------------------------------------------------------------------------
+-- Queries. parse(text) returns the decoded value, or nil if the reply is not
+-- in the documented format.
+-- ---------------------------------------------------------------------------
+local function parseFlag(text)
+  if text == "1" then return true end
+  if text == "0" then return false end
+  return nil
+end
+
+local function parseDiagnostic(tag)
+  return function(text)
+    return text:match("^" .. tag .. "=(.*)$")
+  end
+end
+
+Protocol.Queries = {
+  power = {
+    line = "QPW",
+    parse = function(text)
+      if text == "001" then return "On" end
+      if text == "000" then return "Standby" end
+      return nil
+    end,
+  },
+  input = {
+    line = "QIN",
+    parse = function(text)
+      if text:match("^[%w,:]+$") then return text end
+      return nil
+    end,
+  },
+  shutter = { line = "QSH", parse = parseFlag },
+  freeze = { line = "QFZ", parse = parseFlag },
+  diag1 = { line = "QVX:ERRS1", parse = parseDiagnostic("ERRS1") },
+  diag2 = { line = "QVX:ERRS2", parse = parseDiagnostic("ERRS2") },
+}
+
+return Protocol
+
+end
+
+__modules["runtime"] = function(...)
+-- Runtime wiring: Q-SYS controls <-> engine/poller <-> TCP socket.
+--
+-- Called once from plugin.lua when `Controls` exists. All projector traffic
+-- goes through the engine queue; control handlers never write to the socket.
+return function()
+  local Models = require("models")
+  local Protocol = require("protocol")
+  local Engine = require("engine")
+  local Poller = require("poller")
+
+  local TICK = 0.1
+  -- UNVERIFIED: how often a held lens button repeats its move command.
+  local LENS_REPEAT = 0.3
+
+  local model = Models.Get(Properties["Model"].Value)
+  local ip = Properties["IP Address"].Value
+  local port = Properties["Port"].Value
+  local lensSpeed = Properties["Lens Speed"].Value
+  local debugMode = Properties["Debug Print"].Value
+
+  local function dbg(kind, message)
+    if debugMode == "All" or (debugMode == "Tx/Rx" and (kind == "tx" or kind == "rx")) then
+      print(string.format("[Panasonic %s] %s", kind, tostring(message)))
+    end
+  end
+
+  -- -------------------------------------------------------------------------
+  -- Control helpers. Programmatic changes also fire EventHandlers, so
+  -- feedback writes are wrapped to keep them from being sent back out.
+  -- -------------------------------------------------------------------------
+  local updating = false
+
+  local function setText(control, value)
+    if control.String ~= value then control.String = value end
+  end
+
+  local function setFlag(control, value)
+    updating = true
+    control.Boolean = value
+    updating = false
+  end
+
+  local function setInputText(value)
+    updating = true
+    Controls.Input.String = value
+    updating = false
+  end
+
+  local function detail(message)
+    setText(Controls.DetailText, message or "")
+  end
+
+  -- -------------------------------------------------------------------------
+  -- Inputs: built-in inputs plus any optional inputs enabled in properties.
+  -- -------------------------------------------------------------------------
+  local inputs = {}
+  for _, input in ipairs(model.Inputs) do inputs[#inputs + 1] = input end
+  for _, input in ipairs(model.OptionalInputs or {}) do
+    local prop = Properties[Models.OptionalPropertyName(input)]
+    if prop and prop.Value then inputs[#inputs + 1] = input end
+  end
+
+  local labelToCode, choices = {}, {}
+  for _, input in ipairs(inputs) do
+    labelToCode[input.Label] = input.Code
+    choices[#choices + 1] = input.Label
+  end
+
+  -- Map a QIN reply to a label: exact code first, then a unique match on the
+  -- part after the comma (for example "SD1" for "DM1,SD1").
+  local function labelForReply(reply)
+    for _, input in ipairs(inputs) do
+      if input.Code == reply then return input.Label end
+    end
+    local found
+    for _, input in ipairs(inputs) do
+      local suffix = input.Code:match(",(.+)$")
+      if suffix == reply then
+        if found then return nil end
+        found = input.Label
+      end
+    end
+    return found
+  end
+
+  -- -------------------------------------------------------------------------
+  -- Engine and socket
+  -- -------------------------------------------------------------------------
+  local sock = TcpSocket.New()
+  sock.ReconnectTimeout = 0 -- reconnects are driven by the engine
+
+  local poller -- assigned below; handlers refer to it
+  local known = { shutter = false, freeze = false }
+
+  local COMM_ERRORS = { ["no response"] = true, ["connect timeout"] = true, ["socket error"] = true }
+
+  local function showPowerUnknown()
+    setFlag(Controls.PowerState, false)
+    setText(Controls.PowerText, "Unknown")
+  end
+
+  local function onState(state, why)
+    if state == "Ready" then
+      Controls.Connected.Boolean = true
+      Controls.Status.Value = 0
+      Controls.Status.String = "OK"
+      detail("")
+      Log.Message("Panasonic projector connected: " .. ip)
+      return
+    end
+
+    Controls.Connected.Boolean = false
+    if poller then poller:Reset() end
+    showPowerUnknown()
+
+    if state == "Connecting" or state == "Greeting" then
+      Controls.Status.Value = 5
+      Controls.Status.String = (state == "Connecting") and "Connecting..." or "Initializing..."
+    elseif state == "AuthRequired" then
+      Controls.Status.Value = 2
+      Controls.Status.String = "Command protect is on (authentication not supported)"
+      Log.Error("Panasonic projector requires authentication, which this plugin does not support yet")
+    elseif COMM_ERRORS[why] then
+      Controls.Status.Value = 2
+      Controls.Status.String = "Communication error"
+      detail(tostring(why))
+    else
+      Controls.Status.Value = 4
+      Controls.Status.String = "Disconnected"
+      detail(why and tostring(why) or "")
+    end
+  end
+
+  local engine = Engine.New({
+    send = function(data) sock:Write(data) end,
+    connect = function() sock:Connect(ip, port) end,
+    disconnect = function() sock:Disconnect() end,
+    log = function(kind, message)
+      dbg(kind, message)
+      if kind == "rx" then setText(Controls.LastResponse, message) end
+    end,
+    onState = onState,
+  })
+
+  -- -------------------------------------------------------------------------
+  -- Poll feedback
+  -- -------------------------------------------------------------------------
+  local handlers = {}
+
+  function handlers.power(ok, value, raw)
+    if not ok then
+      showPowerUnknown()
+      poller:SetPower(nil)
+      if raw then detail("Power reply not understood: " .. raw) end
+      return
+    end
+    setFlag(Controls.PowerState, value == "On")
+    setText(Controls.PowerText, value)
+    poller:SetPower(value)
+  end
+
+  function handlers.input(ok, value, raw)
+    if not ok then
+      if raw then detail("Input reply not understood: " .. raw) end
+      return
+    end
+    local label = labelForReply(value)
+    if label then
+      setInputText(label)
+    else
+      setInputText(value)
+      detail("Unrecognized input reply: " .. value)
+    end
+  end
+
+  function handlers.shutter(ok, value)
+    if not ok then return end
+    known.shutter = value
+    setFlag(Controls.Shutter, value)
+  end
+
+  function handlers.freeze(ok, value)
+    if not ok then return end
+    known.freeze = value
+    setFlag(Controls.Freeze, value)
+  end
+
+  function handlers.diag1(ok, _, raw)
+    if ok then setText(Controls.Diag1, raw) end
+  end
+
+  function handlers.diag2(ok, _, raw)
+    if ok then setText(Controls.Diag2, raw) end
+  end
+
+  poller = Poller.New(engine, handlers)
+
+  -- -------------------------------------------------------------------------
+  -- Socket events
+  -- -------------------------------------------------------------------------
+  sock.EventHandler = function(_, event, err)
+    if event == TcpSocket.Events.Connected then
+      engine:OnConnected()
+    elseif event == TcpSocket.Events.Data then
+      local line = sock:ReadLine(TcpSocket.EOL.Custom, "\r")
+      while line do
+        engine:OnLine(line)
+        line = sock:ReadLine(TcpSocket.EOL.Custom, "\r")
+      end
+    elseif event == TcpSocket.Events.Closed then
+      engine:OnClosed("closed")
+    elseif event == TcpSocket.Events.Error or event == TcpSocket.Events.Timeout then
+      engine:OnClosed("socket error")
+    end
+  end
+
+  -- -------------------------------------------------------------------------
+  -- Control handlers (enqueue only)
+  -- -------------------------------------------------------------------------
+  local function send(name, spec, after)
+    engine:Command(nil, spec, function(ok, reason)
+      if not ok then detail(name .. " failed: " .. tostring(reason)) end
+      if after then after(ok) end
+    end)
+  end
+
+  local function pollSoon(key)
+    return function(ok)
+      if ok then poller:PollNow(key) end
+    end
+  end
+
+  Controls.PowerOn.EventHandler = function()
+    send("Power on", Protocol.Commands.PowerOn, pollSoon("power"))
+  end
+  Controls.PowerOff.EventHandler = function()
+    send("Power off", Protocol.Commands.PowerOff, pollSoon("power"))
+  end
+
+  for _, name in ipairs({ "Menu", "Enter", "Up", "Down", "Left", "Right", "Default" }) do
+    Controls[name].EventHandler = function()
+      send(name, Protocol.Commands[name])
+    end
+  end
+
+  if model.Features.AutoSetup then
+    Controls.AutoSetup.EventHandler = function()
+      send("Auto setup", Protocol.Commands.AutoSetup)
+    end
+  end
+
+  Controls.Shutter.EventHandler = function(control)
+    if updating then return end
+    send("Shutter", Protocol.ShutterCommand(control.Boolean), function(ok)
+      if ok then poller:PollNow("shutter") else setFlag(Controls.Shutter, known.shutter) end
+    end)
+  end
+
+  Controls.Freeze.EventHandler = function(control)
+    if updating then return end
+    send("Freeze", Protocol.FreezeCommand(control.Boolean), function(ok)
+      if ok then poller:PollNow("freeze") else setFlag(Controls.Freeze, known.freeze) end
+    end)
+  end
+
+  Controls.Input.Choices = choices
+  Controls.Input.EventHandler = function(control)
+    if updating then return end
+    local code = labelToCode[control.String]
+    if not code then
+      detail("Unknown input: " .. tostring(control.String))
+      return
+    end
+    send("Input", Protocol.InputCommand(code), pollSoon("input"))
+  end
+
+  -- Lens: one move command on press, repeated while held.
+  for _, lens in ipairs(Models.LensControls) do
+    local control = Controls[lens.Name]
+    if model.Features[lens.Feature] and control then
+      local held = false
+      local repeater = Timer.New()
+      local function move()
+        local spec = Protocol.LensCommand(model.Lens[lens.Function], lens.Direction, lensSpeed)
+        engine:Command("lens:" .. lens.Name, spec, function(ok, reason)
+          if not ok then detail(lens.Name .. " failed: " .. tostring(reason)) end
+        end)
+      end
+      repeater.EventHandler = function()
+        if held then move() else repeater:Stop() end
+      end
+      control.EventHandler = function(c)
+        if c.Boolean then
+          held = true
+          move()
+          repeater:Start(LENS_REPEAT)
+        else
+          held = false
+          repeater:Stop()
+        end
+      end
+    end
+  end
+
+  -- -------------------------------------------------------------------------
+  -- Static info and start-up
+  -- -------------------------------------------------------------------------
+  Controls.Model.String = model.Name
+  Controls.IPAddress.String = ip .. ":" .. tostring(port)
+  Controls.Connected.Boolean = false
+  showPowerUnknown()
+
+  local clock = 0
+  local ticker = Timer.New()
+  ticker.EventHandler = function()
+    clock = clock + TICK
+    engine:Tick(clock)
+    poller:Tick(clock)
+  end
+
+  if ip == nil or ip == "" or ip == "0.0.0.0" then
+    Controls.Status.Value = 2
+    Controls.Status.String = "Set the IP Address property"
+    return
+  end
+
+  Controls.Status.Value = 4
+  Controls.Status.String = "Disconnected"
+  engine:Start(clock)
+  ticker:Start(TICK)
+end
+
+end
+
+local Models = require("models")
+
+local function modelOf(props)
+  return Models.Get(props["Model"].Value)
+end
+
+function GetColor(props)
+  return { 28, 72, 128 }
+end
+
+function GetPrettyName(props)
+  return modelOf(props).Name .. " Control"
+end
+
+function GetProperties()
+  local props = {
+    { Name = "Model", Type = "enum", Choices = Models.Ids, Value = Models.Default },
+    { Name = "IP Address", Type = "string", Value = "192.168.10.100" },
+    { Name = "Port", Type = "integer", Min = 1, Max = 65535, Value = 1024 },
+    { Name = "Lens Speed", Type = "enum", Choices = { "Slow", "Normal", "Fast" }, Value = "Normal" },
+  }
+  -- One switch per optional input of every model; the ones that do not
+  -- belong to the selected model are hidden by RectifyProperties.
+  for _, id in ipairs(Models.Ids) do
+    for _, opt in ipairs(Models.ById[id].OptionalInputs or {}) do
+      props[#props + 1] = { Name = Models.OptionalPropertyName(opt), Type = "boolean", Value = false }
+    end
+  end
+  props[#props + 1] = { Name = "Debug Print", Type = "enum", Choices = { "None", "Tx/Rx", "All" }, Value = "None" }
+  return props
+end
+
+function RectifyProperties(props)
+  local selected = props["Model"].Value
+  for _, id in ipairs(Models.Ids) do
+    for _, opt in ipairs(Models.ById[id].OptionalInputs or {}) do
+      local prop = props[Models.OptionalPropertyName(opt)]
+      if prop then prop.IsHidden = (id ~= selected) end
+    end
+  end
+  return props
+end
+
+function GetControls(props)
+  local m = modelOf(props)
+  local ctrls = {}
+
+  local function add(c) ctrls[#ctrls + 1] = c end
+  local function trigger(name)
+    add({ Name = name, ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input", UserPin = true })
+  end
+  local function toggle(name)
+    add({ Name = name, ControlType = "Button", ButtonType = "Toggle", PinStyle = "Both", UserPin = true })
+  end
+  local function text(name)
+    add({ Name = name, ControlType = "Indicator", IndicatorType = "Text", PinStyle = "Output", UserPin = true })
+  end
+  local function led(name)
+    add({ Name = name, ControlType = "Indicator", IndicatorType = "Led", PinStyle = "Output", UserPin = true })
+  end
+
+  trigger("PowerOn")
+  trigger("PowerOff")
+  led("PowerState")
+  text("PowerText")
+
+  add({ Name = "Input", ControlType = "Text", PinStyle = "Both", UserPin = true })
+  toggle("Shutter")
+  toggle("Freeze")
+
+  for _, name in ipairs({ "Menu", "Enter", "Up", "Down", "Left", "Right", "Default" }) do
+    trigger(name)
+  end
+  if m.Features.AutoSetup then trigger("AutoSetup") end
+
+  for _, lens in ipairs(Models.LensControls) do
+    if m.Features[lens.Feature] then
+      add({ Name = lens.Name, ControlType = "Button", ButtonType = "Momentary", PinStyle = "Input", UserPin = true })
+    end
+  end
+
+  led("Connected")
+  add({ Name = "Status", ControlType = "Indicator", IndicatorType = "Status", PinStyle = "Output", UserPin = true })
+  text("Model")
+  text("IPAddress")
+  text("DetailText")
+  text("Diag1")
+  text("Diag2")
+  text("LastResponse")
+
+  return ctrls
+end
+
+function GetControlLayout(props)
+  local m = modelOf(props)
+  local layout, graphics = {}, {}
+  local WHITE = { 255, 255, 255 }
+
+  local function box(title, x, y, w, h)
+    graphics[#graphics + 1] = {
+      Type = "GroupBox", Text = title, Fill = { 52, 56, 64 }, StrokeColor = { 90, 96, 108 },
+      StrokeWidth = 1, CornerRadius = 6, HTextAlign = "Left", Position = { x, y }, Size = { w, h },
+    }
+  end
+  local function label(title, x, y, w)
+    graphics[#graphics + 1] = {
+      Type = "Text", Text = title, Position = { x, y }, Size = { w, 18 }, FontSize = 12,
+      HTextAlign = "Right", Color = WHITE,
+    }
+  end
+  local function control(name, style, x, y, w, h, extra)
+    local c = { PrettyName = name, Style = style, Position = { x, y }, Size = { w, h }, FontSize = 12 }
+    for k, v in pairs(extra or {}) do c[k] = v end
+    layout[name] = c
+  end
+  local function button(name, legend, x, y, w, h)
+    control(name, "Button", x, y, w, h, { Legend = legend })
+  end
+
+  -- Connection
+  box("Connection", 5, 5, 430, 110)
+  label("Model", 15, 30, 85)
+  control("Model", "Text", 105, 28, 160, 22)
+  label("Connected", 275, 30, 85)
+  control("Connected", "Led", 365, 28, 22, 22)
+  label("IP Address", 15, 58, 85)
+  control("IPAddress", "Text", 105, 56, 160, 22)
+  label("Status", 15, 86, 85)
+  control("Status", "Text", 105, 84, 320, 22)
+
+  -- Power
+  box("Power", 5, 120, 430, 60)
+  button("PowerOn", "On", 15, 145, 90, 28)
+  button("PowerOff", "Off", 110, 145, 90, 28)
+  control("PowerState", "Led", 215, 148, 22, 22)
+  control("PowerText", "Text", 242, 148, 100, 22)
+
+  -- Input
+  box("Input", 5, 185, 430, 55)
+  control("Input", "ComboBox", 15, 210, 250, 24)
+
+  -- Image
+  box("Image", 5, 245, 430, 55)
+  button("Shutter", "Shutter", 15, 270, 120, 26)
+  layout["Shutter"].PrettyName = "Shutter (Image Mute)"
+  button("Freeze", "Freeze", 140, 270, 120, 26)
+
+  -- Menu navigation
+  box("Menu", 5, 305, 205, 130)
+  button("Menu", "Menu", 15, 330, 60, 28)
+  button("Up", "Up", 80, 330, 60, 28)
+  button("Default", "Default", 145, 330, 60, 28)
+  button("Left", "Left", 15, 362, 60, 28)
+  button("Enter", "Enter", 80, 362, 60, 28)
+  button("Right", "Right", 145, 362, 60, 28)
+  button("Down", "Down", 80, 394, 60, 28)
+  if m.Features.AutoSetup then button("AutoSetup", "Auto Setup", 145, 394, 60, 28) end
+
+  -- Lens
+  box("Lens", 215, 305, 220, 130)
+  if m.Features.LensShift then
+    button("LensShiftUp", "Up", 266, 330, 42, 28)
+    button("LensShiftLeft", "Left", 222, 362, 42, 28)
+    button("LensShiftRight", "Right", 310, 362, 42, 28)
+    button("LensShiftDown", "Down", 266, 394, 42, 28)
+  end
+  if m.Features.Focus then
+    button("FocusPlus", "Foc +", 358, 330, 34, 28)
+    button("FocusMinus", "Foc -", 394, 330, 34, 28)
+  end
+  if m.Features.Zoom then
+    button("ZoomPlus", "Zm +", 358, 362, 34, 28)
+    button("ZoomMinus", "Zm -", 394, 362, 34, 28)
+  end
+
+  -- Diagnostics
+  box("Diagnostics", 5, 440, 430, 125)
+  label("Detail", 15, 465, 80)
+  control("DetailText", "Text", 100, 463, 325, 22)
+  label("ERRS1", 15, 491, 80)
+  control("Diag1", "Text", 100, 489, 325, 22)
+  label("ERRS2", 15, 517, 80)
+  control("Diag2", "Text", 100, 515, 325, 22)
+  label("Last reply", 15, 543, 80)
+  control("LastResponse", "Text", 100, 541, 325, 22)
+
+  return layout, graphics
+end
+
+function GetPages(props)
+  return { { name = "Control" } }
+end
+
+-- Runtime only: Controls does not exist at design time.
+if Controls then
+  require("runtime")()
+end
