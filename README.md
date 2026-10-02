@@ -13,6 +13,11 @@ A Q-SYS plugin that gives your Core direct control over a Panasonic PT-REQ80 or 
 - Lens shift, focus and zoom (model-dependent), with a configurable lens speed
 - Auto Setup (PT-RQ35K2 only)
 - Live status polling - connection, power, input, shutter and freeze are kept in sync with the projector
+- Projector status: Off / Warming Up / On / Cooling, plus a separate light source (laser) state
+- Projector and light source hours, and intake / exhaust temperatures in C and F (PT-REQ80 adds light source 2 hours and optics / light 1 / light 2 temperatures)
+- Shutter LED indicator alongside the Shutter toggle
+- Configurable poll rate, with a temporary high-rate poll after a command until the status changes
+- Raw command box for testing a documented command from the schematic
 - Automatic reconnect if the projector or network drops
 - Raw `ERRS1` / `ERRS2` diagnostic readout for commissioning
 
@@ -55,6 +60,9 @@ Projector side:
 | Port | Must match the projector's command port (default 1024) |
 | Lens Speed | Slow / Normal / Fast |
 | Optional inputs | One switch per optional input for the selected model |
+| Normal Poll Interval (s) | How often power, lifecycle, input, shutter and freeze are polled while the projector is on (default 2) |
+| High Poll Interval (s) | Poll interval used right after a command, until the status changes (default 1) |
+| High Poll Timeout (s) | Give up on the high-rate poll after this long (default 30) |
 | Debug Print | None / Tx/Rx / All - use Tx/Rx when commissioning |
 
 ## Controls and pins
@@ -68,14 +76,29 @@ All pins are available in the Control Pins section of the Properties panel.
 | Power State Text | Output | Text | Current power state |
 | Input | Both | Combo box | Select / report the active input |
 | Shutter (Image Mute) | Both | Toggle button | true = shutter engaged, image blanked (`OSH:1`); false = image visible (`OSH:0`) |
+| Shutter LED | Output | LED | true while the image is muted |
 | Freeze | Both | Toggle button | Freeze the image |
 | Menu, Up, Down, Left, Right, Enter, Default | Input | Button | Projector menu navigation |
 | Auto Setup | Input | Button | PT-RQ35K2 only |
 | Lens Shift, Focus, Zoom | Input | Momentary button | Lens control (model-dependent) |
+| Projector State | Output | Text | Off / Warming Up / On / Cooling (`QVX:POWI1`) |
+| Light Source State | Output | Text | Off / Starting / On / Cooling (`Q$S`) |
+| Projector Hours, Light Source 1 Hours | Output | Text | Run time (`QVX:RTMS1`, `QVX:LRTS3=00`) |
+| Light Source 2 Hours | Output | Text | PT-REQ80 only (`QVX:LRTS3=01`) |
+| Intake / Exhaust Temp C and F | Output | Text | `QTM:0`, `QTM:1`; shown as returned, no conversion |
+| Optics / Light 1 / Light 2 Temp C and F | Output | Text | PT-REQ80 only (`QTM:2`, `QTM:11`, `QTM:12`) |
 | Connected | Output | LED | true when the projector is reachable |
 | Status | Output | Status | Connection state |
 | Model, IP Address | Output | Text | What this block is talking to |
 | Detail, ERRS1, ERRS2, Last Reply | Output | Text | Diagnostics |
+| Raw Command, Send, Reply | Both / Input / Output | Text, Button | Send one documented command and see the reply. It is never retried. |
+
+## Polling
+
+- Projector off (standby): power and the lifecycle states every 10 seconds.
+- Projector on: power, lifecycle, input, shutter and freeze at the Normal Poll Interval; diagnostics every 5 s; temperatures every 15 s; hours every 60 s.
+- After a command (power, shutter, freeze, input) the affected status is polled at the High Poll Interval until the projector reports the expected value or the High Poll Timeout passes. Warming Up and Cooling are polled the same way until they finish.
+- An unrecognized or malformed reply shows `Unknown` (or keeps the last good value for hours and temperatures) and the raw reply is shown in Detail.
 
 ## Troubleshooting
 
@@ -128,6 +151,7 @@ Settle these in the lab; each is isolated so the fix is local.
 5. **Slot-input replies** to `QIN`: matched exactly, then by the part after the comma. Unrecognized replies are shown raw.
 6. **Socket reconnect**: the plugin sets `ReconnectTimeout = 0` and reconnects from the engine. Confirm that disables the socket's own reconnect in Designer 10.5.
 7. **Layout styles**: the `Status` indicator uses `Style = "Text"` and the input uses `ComboBox`; confirm they render correctly in Designer.
+8. **Status replies**: the reply formats for `QVX:POWI1`, `Q$S`, `QTM:n`, `QVX:RTMS1` and `QVX:LRTS3=nn` follow the supplied status reference; confirm them on hardware.
 
 ## Not in version 1
 

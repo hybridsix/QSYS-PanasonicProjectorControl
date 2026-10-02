@@ -36,5 +36,10 @@ return {
     Focus = true,
     Zoom = true,
     SelfDiagnosis = true,
+    -- Status sensors documented for the REQ80 family only.
+    Light2Hours = true, -- QVX:LRTS3=01
+    TempOptics = true,  -- QTM:2
+    TempLight1 = true,  -- QTM:11
+    TempLight2 = true,  -- QTM:12
   },
 }

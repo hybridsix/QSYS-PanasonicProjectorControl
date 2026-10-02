@@ -93,6 +93,8 @@ local mocks = {}
 
 local function installMocks(overrides)
   mocks.printed, mocks.timers, mocks.logs, mocks.socket = {}, {}, {}, nil
+  mocks.answered = 0
+  mocks.replies = {}
 
   Properties = propsFromDefaults(overrides)
 
@@ -191,6 +193,45 @@ local function connect(powerReply)
   tick(1)
   T.eq(lastWritten(), "00QPW\r")
   feed(powerReply)
+  mocks.answered = #sock.written
+end
+
+-- A mock projector: answers every unanswered write, using `replies` (command
+-- -> reply) first, then the defaults. Commands with no entry are acknowledged.
+local DEFAULT_REPLIES = {
+  QPW = "001", ["QVX:POWI1"] = "POWI1=+00003", ["Q$S"] = "2",
+  QIN = "HD1", QSH = "0", QFZ = "0",
+  ["QVX:ERRS1"] = "ERRS1=00000000", ["QVX:ERRS2"] = "ERRS2=00000000",
+  ["QTM:0"] = "35/95", ["QTM:1"] = "40/104", ["QTM:2"] = "30/86",
+  ["QTM:11"] = "45/113", ["QTM:12"] = "46/115",
+  ["QVX:RTMS1"] = "RTMS1=1234", ["QVX:LRTS3=00"] = "LRTS3=00:567", ["QVX:LRTS3=01"] = "LRTS3=01:89",
+}
+
+local function drain(replies)
+  local sock = mocks.socket
+  local guard = 0
+  while mocks.answered < #sock.written do
+    mocks.answered = mocks.answered + 1
+    local cmd = sock.written[mocks.answered]:gsub("^00", ""):gsub("\r$", "")
+    local reply = (replies and replies[cmd]) or mocks.replies[cmd] or DEFAULT_REPLIES[cmd] or ("00" .. cmd)
+    feed(reply)
+    guard = guard + 1
+    if guard > 500 then error("drain did not settle") end
+  end
+end
+
+-- Queues every due poll and answers them all.
+local function settle(replies)
+  tick(1)
+  drain(replies)
+end
+
+local function countWritten(cmd)
+  local n = 0
+  for _, w in ipairs(mocks.socket.written) do
+    if w == "00" .. cmd .. "\r" then n = n + 1 end
+  end
+  return n
 end
 
 local ok, runtimeErr = pcall(function()
@@ -220,20 +261,15 @@ local ok, runtimeErr = pcall(function()
     T.eq(Controls.LastResponse.String, "001")
     -- Power On makes the other items due on the next tick.
     tick(1)
-    T.eq(lastWritten(), "00QIN\r")
-    feed("HD2")
+    T.eq(lastWritten(), "00QVX:POWI1\r")
+    drain({ QIN = "HD2", QSH = "1", QFZ = "0", ["Q$S"] = "2" })
+    T.eq(Controls.ProjectorState.String, "On")
+    T.eq(Controls.LightSourceState.String, "On")
     T.eq(Controls.Input.String, "HDMI 2")
-    T.eq(lastWritten(), "00QSH\r")
-    feed("1")
     T.eq(Controls.Shutter.Boolean, true)
-    T.eq(lastWritten(), "00QFZ\r")
-    feed("0")
+    T.eq(Controls.ShutterState.Boolean, true)
     T.eq(Controls.Freeze.Boolean, false)
-    T.eq(lastWritten(), "00QVX:ERRS1\r")
-    feed("ERRS1=00000000")
     T.eq(Controls.Diag1.String, "ERRS1=00000000")
-    T.eq(lastWritten(), "00QVX:ERRS2\r")
-    feed("ERRS2=00000000")
     T.eq(Controls.Diag2.String, "ERRS2=00000000")
   end)
 
@@ -242,6 +278,9 @@ local ok, runtimeErr = pcall(function()
     connect("000")
     T.eq(Controls.PowerState.Boolean, false)
     T.eq(Controls.PowerText.String, "Standby")
+    settle({ ["QVX:POWI1"] = "POWI1=+00001", ["Q$S"] = "0" })
+    T.eq(Controls.ProjectorState.String, "Off")
+    T.eq(Controls.LightSourceState.String, "Off")
     local before = #mocks.socket.written
     tick(50) -- 5 seconds
     T.eq(#mocks.socket.written, before, "nothing but power is polled in standby")
@@ -250,13 +289,13 @@ local ok, runtimeErr = pcall(function()
   T.test("button presses are queued, not written directly", function()
     installMocks()
     connect("001")
-    -- A poll (QIN) is now in flight, so the command must wait for it.
+    -- A poll is now in flight, so the command must wait for it.
     tick(1)
-    T.eq(lastWritten(), "00QIN\r")
+    T.eq(lastWritten(), "00QVX:POWI1\r")
     local before = #mocks.socket.written
     Controls.Menu.EventHandler(Controls.Menu)
     T.eq(#mocks.socket.written, before, "must wait for the in-flight reply")
-    feed("HD1")
+    feed("POWI1=+00003")
     T.eq(lastWritten(), "00OMN\r")
     feed("00OMN")
   end)
@@ -264,19 +303,20 @@ local ok, runtimeErr = pcall(function()
   T.test("shutter toggle sends the explicit state and re-polls", function()
     installMocks()
     connect("001")
-    tick(1); feed("HD1"); feed("0"); feed("0"); feed("ERRS1=0"); feed("ERRS2=0")
+    settle()
     Controls.Shutter.Boolean = true
     T.eq(lastWritten(), "00OSH:1\r")
     feed("00OSH:1")
     T.eq(lastWritten(), "00QSH\r")
     feed("1")
     T.eq(Controls.Shutter.Boolean, true)
+    T.eq(Controls.ShutterState.Boolean, true)
   end)
 
   T.test("shutter true means shutter engaged (OSH:1); false opens it (OSH:0)", function()
     installMocks()
     connect("001")
-    tick(1); feed("HD1"); feed("0"); feed("0"); feed("ERRS1=0"); feed("ERRS2=0")
+    settle()
     Controls.Shutter.Boolean = true
     T.eq(lastWritten(), "00OSH:1\r")
     feed("00OSH:1"); feed("1")
@@ -287,7 +327,7 @@ local ok, runtimeErr = pcall(function()
   T.test("Auto Setup sends OAS on the PT-RQ35K2", function()
     installMocks({ Model = "PT-RQ35K2" })
     connect("001")
-    tick(1); feed("HD1"); feed("0"); feed("0"); feed("ERRS1=0"); feed("ERRS2=0")
+    settle()
     Controls.AutoSetup.EventHandler(Controls.AutoSetup)
     T.eq(lastWritten(), "00OAS\r")
   end)
@@ -295,7 +335,7 @@ local ok, runtimeErr = pcall(function()
   T.test("input selection sends the model code", function()
     installMocks()
     connect("001")
-    tick(1); feed("HD1"); feed("0"); feed("0"); feed("ERRS1=0"); feed("ERRS2=0")
+    settle()
     Controls.Input.String = "DisplayPort"
     T.eq(lastWritten(), "00IIS:DP1\r")
   end)
@@ -303,7 +343,7 @@ local ok, runtimeErr = pcall(function()
   T.test("feedback updates do not echo back as commands", function()
     installMocks()
     connect("001")
-    tick(1); feed("HD2"); feed("1"); feed("1"); feed("ERRS1=0"); feed("ERRS2=0")
+    settle({ QIN = "HD2", QSH = "1", QFZ = "1" })
     -- Shutter, freeze and input feedback all assigned controls whose handlers
     -- would send commands if they were not guarded.
     T.eq(Controls.Shutter.Boolean, true)
@@ -319,7 +359,7 @@ local ok, runtimeErr = pcall(function()
   T.test("a failed shutter command reverts the control", function()
     installMocks()
     connect("001")
-    tick(1); feed("HD1"); feed("0"); feed("0"); feed("ERRS1=0"); feed("ERRS2=0")
+    settle()
     Controls.Shutter.Boolean = true
     feed("ER403")
     T.eq(Controls.Shutter.Boolean, false)
@@ -329,7 +369,7 @@ local ok, runtimeErr = pcall(function()
   T.test("lens button sends on press and repeats while held", function()
     installMocks({ ["Lens Speed"] = "Normal" })
     connect("001")
-    tick(1); feed("HD1"); feed("0"); feed("0"); feed("ERRS1=0"); feed("ERRS2=0")
+    settle()
     local c = Controls.FocusPlus
     c.Boolean = true
     T.eq(lastWritten(), "00VXX:LNSI4=+00100\r")
@@ -353,7 +393,7 @@ local ok, runtimeErr = pcall(function()
   T.test("lens repeat does not pile up behind a slow projector", function()
     installMocks()
     connect("001")
-    tick(1); feed("HD1"); feed("0"); feed("0"); feed("ERRS1=0"); feed("ERRS2=0")
+    settle()
     local c = Controls.ZoomMinus
     c.Boolean = true
     local sent = #mocks.socket.written
@@ -421,19 +461,127 @@ local ok, runtimeErr = pcall(function()
   T.test("optional input replies resolve by unique suffix", function()
     installMocks({ Model = "PT-REQ80", ["Show SDM 12G-SDI"] = true })
     connect("001")
-    tick(1)
-    T.eq(lastWritten(), "00QIN\r")
-    feed("SD1")
+    settle({ QIN = "SD1" })
     T.eq(Controls.Input.String, "SDM 12G-SDI")
   end)
 
   T.test("an unrecognised input reply is shown rather than hidden", function()
     installMocks()
     connect("001")
-    tick(1)
-    feed("ZZ9")
+    settle({ QIN = "ZZ9" })
     T.eq(Controls.Input.String, "ZZ9")
     T.truthy(Controls.DetailText.String:find("Unrecognized input", 1, true))
+  end)
+
+  T.test("hours and temperatures are shown as returned (REQ80 has all of them)", function()
+    installMocks({ Model = "PT-REQ80" })
+    connect("001")
+    settle({ ["QTM:1"] = "-5/23" })
+    T.eq(Controls.ProjectorHours.String, "1234")
+    T.eq(Controls.LightSource1Hours.String, "567")
+    T.eq(Controls.LightSource2Hours.String, "89")
+    T.eq(Controls.TemperatureIntakeC.String, "35")
+    T.eq(Controls.TemperatureIntakeF.String, "95")
+    T.eq(Controls.TemperatureExhaustC.String, "-5")
+    T.eq(Controls.TemperatureExhaustF.String, "23")
+    T.eq(Controls.TemperatureOpticsC.String, "30")
+    T.eq(Controls.TemperatureLight1C.String, "45")
+    T.eq(Controls.TemperatureLight2F.String, "115")
+  end)
+
+  T.test("the PT-RQ35K2 is never sent REQ80-only status queries", function()
+    installMocks({ Model = "PT-RQ35K2" })
+    connect("001")
+    settle()
+    for _ = 1, 700 do tick(1); drain() end -- more than a minute
+    for _, cmd in ipairs({ "QTM:2", "QTM:11", "QTM:12", "QVX:LRTS3=01" }) do
+      T.eq(countWritten(cmd), 0, cmd .. " must not be sent to the RQ35K2")
+    end
+    T.truthy(countWritten("QTM:0") > 0)
+    T.truthy(countWritten("QVX:LRTS3=00") > 0)
+    T.eq(Controls.ProjectorHours.String, "1234")
+    T.eq(Controls.LightSource1Hours.String, "567")
+  end)
+
+  T.test("REQ80-only controls exist only on the REQ80", function()
+    local function names(model)
+      local set = {}
+      for _, c in ipairs(GetControls(propsFromDefaults({ Model = model }))) do set[c.Name] = true end
+      return set
+    end
+    local req, rq = names("PT-REQ80"), names("PT-RQ35K2")
+    for _, name in ipairs({ "LightSource2Hours", "TemperatureOpticsC", "TemperatureLight1F", "TemperatureLight2C" }) do
+      T.truthy(req[name], name)
+      T.falsy(rq[name], name)
+    end
+    for _, name in ipairs({ "ProjectorState", "LightSourceState", "ProjectorHours", "LightSource1Hours", "TemperatureIntakeC", "TemperatureExhaustF" }) do
+      T.truthy(req[name], name)
+      T.truthy(rq[name], name)
+    end
+  end)
+
+  T.test("power and light lifecycle states are shown, and unknown codes keep the raw reply", function()
+    installMocks()
+    connect("001")
+    settle({ ["QVX:POWI1"] = "POWI1=+00004", ["Q$S"] = "3" })
+    T.eq(Controls.ProjectorState.String, "Cooling")
+    T.eq(Controls.LightSourceState.String, "Cooling")
+    mocks.replies["QVX:POWI1"] = "POWI1=+00009"
+    mocks.replies["Q$S"] = "7"
+    for _ = 1, 25 do tick(1); drain() end
+    T.eq(Controls.ProjectorState.String, "Unknown")
+    T.eq(Controls.LightSourceState.String, "Unknown")
+    T.truthy(Controls.DetailText.String:find("POWI1=+00009", 1, true) or Controls.DetailText.String:find("7", 1, true))
+  end)
+
+  T.test("a bad hours or temperature reply keeps the previous value", function()
+    installMocks()
+    connect("001")
+    settle()
+    mocks.replies["QVX:RTMS1"] = "garbage"
+    mocks.replies["QTM:0"] = "oops"
+    for _ = 1, 700 do tick(1); drain() end
+    T.eq(Controls.ProjectorHours.String, "1234")
+    T.eq(Controls.TemperatureIntakeC.String, "35")
+    T.truthy(Controls.DetailText.String ~= "")
+  end)
+
+  T.test("power on polls the lifecycle at the high rate until the projector is on", function()
+    installMocks()
+    connect("000")
+    settle({ ["QVX:POWI1"] = "POWI1=+00001", ["Q$S"] = "0" })
+    T.eq(Controls.ProjectorState.String, "Off")
+    mocks.replies.QPW = "000"
+    mocks.replies["QVX:POWI1"] = "POWI1=+00002"
+    Controls.PowerOn.EventHandler(Controls.PowerOn)
+    T.eq(countWritten("PON"), 1)
+    drain()
+    T.eq(Controls.ProjectorState.String, "Warming Up")
+    -- Standby polls every 10s, so repeated polls within ~2s prove the boost.
+    local before = countWritten("QVX:POWI1")
+    for _ = 1, 22 do tick(1); drain() end
+    T.truthy(countWritten("QVX:POWI1") - before >= 2, "lifecycle should be polled at the high rate")
+    -- The projector comes on: the boost ends and polling returns to normal.
+    mocks.replies["QVX:POWI1"] = "POWI1=+00003"
+    mocks.replies.QPW = "001"
+    mocks.replies["Q$S"] = "2"
+    for _ = 1, 22 do tick(1); drain() end
+    T.eq(Controls.ProjectorState.String, "On")
+    T.eq(Controls.PowerText.String, "On")
+    local settledAt = countWritten("QVX:POWI1")
+    for _ = 1, 50 do tick(1); drain() end
+    T.truthy(countWritten("QVX:POWI1") - settledAt <= 3, "back to the normal poll interval")
+  end)
+
+  T.test("the raw command is never retried and shows the reply", function()
+    installMocks()
+    connect("001")
+    settle()
+    Controls.CustomCommand.String = "QVX:TEST"
+    Controls.CustomSend.EventHandler(Controls.CustomSend)
+    T.eq(lastWritten(), "00QVX:TEST\r")
+    feed("TEST=1")
+    T.eq(Controls.CustomReply.String, "TEST=1")
   end)
 
   T.test("debug print is off by default and logs traffic when enabled", function()

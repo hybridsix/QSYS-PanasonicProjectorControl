@@ -15,6 +15,23 @@ local function modelOf(props)
   return Models.Get(props["Model"].Value)
 end
 
+-- Temperature sensors; those with a Feature exist on some models only.
+local TemperatureSensors = {
+  { Prefix = "TemperatureIntake", Label = "Intake" },
+  { Prefix = "TemperatureExhaust", Label = "Exhaust" },
+  { Prefix = "TemperatureOptics", Label = "Optics", Feature = "TempOptics" },
+  { Prefix = "TemperatureLight1", Label = "Light 1", Feature = "TempLight1" },
+  { Prefix = "TemperatureLight2", Label = "Light 2", Feature = "TempLight2" },
+}
+
+local function sensorsFor(model)
+  local list = {}
+  for _, sensor in ipairs(TemperatureSensors) do
+    if not sensor.Feature or model.Features[sensor.Feature] then list[#list + 1] = sensor end
+  end
+  return list
+end
+
 -- Colour bar on the plugin block in the schematic.
 -- Clair Global "Patch of Blue" brand colour (#15a3d5 family).
 function GetColor(props)
@@ -104,6 +121,16 @@ function GetControls(props)
   add({ Name = "Status", ControlType = "Indicator", IndicatorType = "Status", PinStyle = "Output", UserPin = true })
   text("Model")
   text("IPAddress")
+
+  text("LightSourceState")
+  text("ProjectorHours")
+  text("LightSource1Hours")
+  if m.Features.Light2Hours then text("LightSource2Hours") end
+  for _, sensor in ipairs(sensorsFor(m)) do
+    text(sensor.Prefix .. "C")
+    text(sensor.Prefix .. "F")
+  end
+
   text("DetailText")
   text("Diag1")
   text("Diag2")
@@ -124,7 +151,7 @@ function GetControlLayout(props)
     Model = "Status~Model", Connected = "Status~Connected", IPAddress = "Status~IP Address",
     Status = "Status~Connection",
     PowerOn = "Power~On", PowerOff = "Power~Off", PowerState = "Power~State",
-    PowerText = "Power~State Text", ProjectorState = "Power~Projector State",
+    PowerText = "Power~State Text", ProjectorState = "Health~Projector State",
     Input = "Input~Select",
     ShutterState = "Image~Shutter LED", Shutter = "Image~Shutter (Image Mute)", Freeze = "Image~Freeze",
     Menu = "Menu~Menu", Up = "Menu~Up", Down = "Menu~Down", Left = "Menu~Left",
@@ -136,7 +163,16 @@ function GetControlLayout(props)
     ZoomPlus = "Lens~Zoom +", ZoomMinus = "Lens~Zoom -",
     DetailText = "Diagnostics~Detail", Diag1 = "Diagnostics~ERRS1", Diag2 = "Diagnostics~ERRS2",
     LastResponse = "Diagnostics~Last Reply",
+    LightSourceState = "Health~Light Source State",
+    ProjectorHours = "Health~Projector Hours",
+    LightSource1Hours = "Health~Light Source 1 Hours",
+    LightSource2Hours = "Health~Light Source 2 Hours",
+    CustomCommand = "Raw~Command", CustomSend = "Raw~Send", CustomReply = "Raw~Reply",
   }
+  for _, sensor in ipairs(TemperatureSensors) do
+    PRETTY[sensor.Prefix .. "C"] = "Health~" .. sensor.Label .. " Temp C"
+    PRETTY[sensor.Prefix .. "F"] = "Health~" .. sensor.Label .. " Temp F"
+  end
 
   -- Panel width 500px: boxes at x=5, w=490, 5px grid.
   local function box(title, x, y, w, h)
@@ -176,8 +212,7 @@ function GetControlLayout(props)
   button("PowerOn", "Power On", 10, 145, 130, 28, { 0, 200, 220 })
   button("PowerOff", "Power Off", 145, 145, 130, 28, { 255, 140, 0 })
   control("PowerState", "Led", 290, 148, 22, 22)
-  control("PowerText", "Text", 317, 148, 110, 22)
-  control("ProjectorState", "Text", 432, 148, 48, 22)
+  control("PowerText", "Text", 317, 148, 140, 22)
 
   -- Input
   box("Input", 5, 185, 490, 55)
@@ -217,22 +252,53 @@ function GetControlLayout(props)
     button("ZoomMinus", "Zm -", 445, 362, 40, 28)
   end
 
+  -- Projector status: lifecycle, light source, hours and temperatures.
+  -- Temperatures are shown as returned by the projector (C and F).
+  local sensors = sensorsFor(m)
+  local sy = 440
+  local sensorRows = math.ceil(#sensors / 2)
+  local sh = 77 + sensorRows * 26 + 8
+  box("Projector Status", 5, sy, 490, sh)
+  label("State:", 10, sy + 25, 75)
+  control("ProjectorState", "Text", 90, sy + 23, 125, 22)
+  label("Light Source:", 220, sy + 25, 80)
+  control("LightSourceState", "Text", 305, sy + 23, 125, 22)
+  label("Hours:", 10, sy + 51, 75)
+  control("ProjectorHours", "Text", 90, sy + 49, 70, 22)
+  label("Light 1:", 165, sy + 51, 50)
+  control("LightSource1Hours", "Text", 220, sy + 49, 70, 22)
+  if m.Features.Light2Hours then
+    label("Light 2:", 295, sy + 51, 50)
+    control("LightSource2Hours", "Text", 350, sy + 49, 70, 22)
+  end
+  for i, sensor in ipairs(sensors) do
+    local col = (i - 1) % 2
+    local row = math.floor((i - 1) / 2)
+    local x = (col == 0) and 10 or 250
+    local y = sy + 77 + row * 26
+    label(sensor.Label .. " C/F:", x, y + 2, 75)
+    control(sensor.Prefix .. "C", "Text", x + 80, y, 60, 22)
+    control(sensor.Prefix .. "F", "Text", x + 145, y, 60, 22)
+  end
+
   -- Diagnostics
-  box("Diagnostics", 5, 440, 490, 125)
-  label("Detail:", 10, 465, 75)
-  control("DetailText", "Text", 90, 463, 390, 22)
-  label("ERRS1:", 10, 491, 75)
-  control("Diag1", "Text", 90, 489, 390, 22)
-  label("ERRS2:", 10, 517, 75)
-  control("Diag2", "Text", 90, 515, 390, 22)
-  label("Last Reply:", 10, 543, 75)
-  control("LastResponse", "Text", 90, 541, 390, 22)
+  local dy = sy + sh + 5
+  box("Diagnostics", 5, dy, 490, 125)
+  label("Detail:", 10, dy + 25, 75)
+  control("DetailText", "Text", 90, dy + 23, 390, 22)
+  label("ERRS1:", 10, dy + 51, 75)
+  control("Diag1", "Text", 90, dy + 49, 390, 22)
+  label("ERRS2:", 10, dy + 77, 75)
+  control("Diag2", "Text", 90, dy + 75, 390, 22)
+  label("Last Reply:", 10, dy + 103, 75)
+  control("LastResponse", "Text", 90, dy + 101, 390, 22)
 
   -- Raw command testing
-  box("Raw Command", 5, 570, 490, 75)
-  control("CustomCommand", "TextBox", 15, 596, 290, 24)
-  button("CustomSend", "Send", 315, 594, 70, 28, { 0, 200, 220 })
-  control("CustomReply", "Text", 395, 596, 90, 22)
+  local ry = dy + 130
+  box("Raw Command", 5, ry, 490, 75)
+  control("CustomCommand", "TextBox", 15, ry + 26, 270, 24)
+  button("CustomSend", "Send", 290, ry + 24, 60, 28, { 0, 200, 220 })
+  control("CustomReply", "Text", 355, ry + 26, 130, 22)
 
   return layout, graphics
 end

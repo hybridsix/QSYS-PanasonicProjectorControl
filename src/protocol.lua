@@ -105,6 +105,44 @@ local function parseDiagnostic(tag)
   end
 end
 
+local function trim(text)
+  return (text:match("^%s*(.-)%s*$"))
+end
+
+-- QVX:POWI1 -> POWI1=+0000n. Unknown codes are reported as "Unknown" rather
+-- than failing, so the raw reply can be shown.
+Protocol.PowerLifecycle = { [1] = "Off", [2] = "Warming Up", [3] = "On", [4] = "Cooling" }
+
+local function parsePowerLifecycle(text)
+  local code = trim(text):match("^POWI1=([%+%-]?%d+)$")
+  if not code then return nil end
+  return Protocol.PowerLifecycle[tonumber(code)] or "Unknown"
+end
+
+-- Q$S -> light source lifecycle. This is separate from the power lifecycle.
+Protocol.LightLifecycle = { [0] = "Off", [1] = "Starting", [2] = "On", [3] = "Cooling" }
+
+local function parseLightLifecycle(text)
+  local code = trim(text):match("^(%d)$")
+  if not code then return nil end
+  return Protocol.LightLifecycle[tonumber(code)] or "Unknown"
+end
+
+-- Temperature replies are <Celsius>/<Fahrenheit>; both values are used as
+-- returned (no conversion), and negative values are allowed.
+local function parseTemperature(text)
+  local c, f = trim(text):match("^([%+%-]?%d+)%s*/%s*([%+%-]?%d+)$")
+  if not c then return nil end
+  return { c = tonumber(c), f = tonumber(f) }
+end
+
+local function parseHours(pattern)
+  return function(text)
+    local hours = trim(text):match(pattern)
+    return hours and tonumber(hours) or nil
+  end
+end
+
 Protocol.Queries = {
   power = {
     line = "QPW",
@@ -114,6 +152,8 @@ Protocol.Queries = {
       return nil
     end,
   },
+  powi = { line = "QVX:POWI1", parse = parsePowerLifecycle },
+  lightstate = { line = "Q$S", parse = parseLightLifecycle },
   input = {
     line = "QIN",
     parse = function(text)
@@ -125,6 +165,14 @@ Protocol.Queries = {
   freeze = { line = "QFZ", parse = parseFlag },
   diag1 = { line = "QVX:ERRS1", parse = parseDiagnostic("ERRS1") },
   diag2 = { line = "QVX:ERRS2", parse = parseDiagnostic("ERRS2") },
+  tempIntake = { line = "QTM:0", parse = parseTemperature },
+  tempExhaust = { line = "QTM:1", parse = parseTemperature },
+  tempOptics = { line = "QTM:2", parse = parseTemperature },    -- PT-REQ80 only
+  tempLight1 = { line = "QTM:11", parse = parseTemperature },   -- PT-REQ80 only
+  tempLight2 = { line = "QTM:12", parse = parseTemperature },   -- PT-REQ80 only
+  hoursProj = { line = "QVX:RTMS1", parse = parseHours("^RTMS1=(%d+)$") },
+  hoursLight1 = { line = "QVX:LRTS3=00", parse = parseHours("^LRTS3=00:(%d+)$") },
+  hoursLight2 = { line = "QVX:LRTS3=01", parse = parseHours("^LRTS3=01:(%d+)$") }, -- PT-REQ80 only
 }
 
 return Protocol

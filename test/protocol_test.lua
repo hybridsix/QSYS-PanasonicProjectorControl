@@ -119,4 +119,57 @@ T.test("optional input labels are unique across models", function()
   end
 end)
 
+T.test("status query lines match the reference", function()
+  local q = Protocol.Queries
+  T.eq(q.powi.line, "QVX:POWI1")
+  T.eq(q.lightstate.line, "Q$S")
+  T.eq(q.tempIntake.line, "QTM:0")
+  T.eq(q.tempExhaust.line, "QTM:1")
+  T.eq(q.tempOptics.line, "QTM:2")
+  T.eq(q.tempLight1.line, "QTM:11")
+  T.eq(q.tempLight2.line, "QTM:12")
+  T.eq(q.hoursProj.line, "QVX:RTMS1")
+  T.eq(q.hoursLight1.line, "QVX:LRTS3=00")
+  T.eq(q.hoursLight2.line, "QVX:LRTS3=01")
+end)
+
+T.test("power lifecycle parser", function()
+  local parse = Protocol.Queries.powi.parse
+  T.eq(parse("POWI1=+00001"), "Off")
+  T.eq(parse("POWI1=+00002"), "Warming Up")
+  T.eq(parse("POWI1=+00003"), "On")
+  T.eq(parse("POWI1=+00004"), "Cooling")
+  T.eq(parse("POWI1=+00009"), "Unknown")
+  T.eq(parse("garbage"), nil)
+end)
+
+T.test("light lifecycle parser", function()
+  local parse = Protocol.Queries.lightstate.parse
+  T.eq(parse("0"), "Off")
+  T.eq(parse("1"), "Starting")
+  T.eq(parse("2"), "On")
+  T.eq(parse("3"), "Cooling")
+  T.eq(parse("7"), "Unknown")
+  T.eq(parse("x"), nil)
+end)
+
+T.test("temperature parser keeps both values and allows negatives", function()
+  local parse = Protocol.Queries.tempIntake.parse
+  local t = parse("35/95")
+  T.eq(t.c, 35)
+  T.eq(t.f, 95)
+  t = parse("-5/23")
+  T.eq(t.c, -5)
+  T.eq(t.f, 23)
+  T.eq(parse("hot"), nil)
+end)
+
+T.test("hours parsers", function()
+  T.eq(Protocol.Queries.hoursProj.parse("RTMS1=1234"), 1234)
+  T.eq(Protocol.Queries.hoursLight1.parse("LRTS3=00:567"), 567)
+  T.eq(Protocol.Queries.hoursLight2.parse("LRTS3=01:89"), 89)
+  T.eq(Protocol.Queries.hoursLight1.parse("LRTS3=01:89"), nil)
+  T.eq(Protocol.Queries.hoursProj.parse("nope"), nil)
+end)
+
 return T.finish()
