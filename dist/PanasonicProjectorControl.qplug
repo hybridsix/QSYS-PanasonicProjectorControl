@@ -1,10 +1,25 @@
+-- =============================================================
+-- info.lua -- Panasonic Projector Control
+--
+-- Plugin identity block. Embedded in the .qplug file and read by
+-- Q-SYS Designer when loading the plugin.
+--
+-- Version is injected from package.json by build.js. Do not edit
+-- it here.
+--
+-- Id is a stable GUID that uniquely identifies this plugin.
+-- Do not change it after the plugin has been deployed, or
+-- existing designs will lose the reference and need to be
+-- manually reconnected.
+-- =============================================================
+
 PluginInfo = {
-  Name = "Panasonic~Projector Control",
+  Name = "Hybridsix Software~Panasonic Projector Control",
   Version = "0.1.0",
   BuildVersion = "0.1.0.0",
   Id = "eb89b070-8e63-4d3d-a30a-2234f9da3fc9",
-  Author = "hybridsix",
-  Description = "Control Panasonic PT-REQ80 and PT-RQ35K2 projectors over Panasonic LAN command control (TCP).",
+  Author = "Michael King",
+  Description = "Control Panasonic PT-REQ80 and PT-RQ35K2 projectors from Q-SYS: power, input, shutter, freeze, menu and lens control over Panasonic LAN command control (TCP), with live status feedback.",
 }
 
 
@@ -1001,18 +1016,34 @@ end
 
 end
 
+-- =============================================================
+-- plugin.lua
+-- Panasonic Projector Control
+-- Author: Michael King
+--
+-- Design-time definition (properties, controls, layout, pages)
+-- plus the runtime hook. Runtime logic lives in runtime.lua and
+-- only executes on a running Core. build.js bundles src/ into
+-- the single .qplug file that Q-SYS Designer loads.
+-- =============================================================
+
 local Models = require("models")
 
 local function modelOf(props)
   return Models.Get(props["Model"].Value)
 end
 
+-- Colour bar on the plugin block in the schematic.
+-- Clair Global "Patch of Blue" brand colour (#15a3d5 family).
 function GetColor(props)
-  return { 28, 72, 128 }
+  return { 0, 210, 255 }
 end
 
+-- Block face label. Non-breaking spaces (U+00A0) stop Q-SYS from
+-- word-wrapping the title. The selected model is shown underneath.
 function GetPrettyName(props)
-  return modelOf(props).Name .. " Control"
+  local nbsp = "\xC2\xA0"
+  return "Projector" .. nbsp .. "Control" .. "\n" .. modelOf(props).Name
 end
 
 function GetProperties()
@@ -1097,59 +1128,76 @@ end
 function GetControlLayout(props)
   local m = modelOf(props)
   local layout, graphics = {}, {}
-  local WHITE = { 255, 255, 255 }
+  local TEXT = { 60, 60, 60 }
+  local PRETTY = {
+    Model = "Status~Model", Connected = "Status~Connected", IPAddress = "Status~IP Address",
+    Status = "Status~Connection",
+    PowerOn = "Power~On", PowerOff = "Power~Off", PowerState = "Power~State",
+    PowerText = "Power~State Text",
+    Input = "Input~Select",
+    Shutter = "Image~Shutter (Image Mute)", Freeze = "Image~Freeze",
+    Menu = "Menu~Menu", Up = "Menu~Up", Down = "Menu~Down", Left = "Menu~Left",
+    Right = "Menu~Right", Enter = "Menu~Enter", Default = "Menu~Default",
+    AutoSetup = "Menu~Auto Setup",
+    LensShiftUp = "Lens~Shift Up", LensShiftDown = "Lens~Shift Down",
+    LensShiftLeft = "Lens~Shift Left", LensShiftRight = "Lens~Shift Right",
+    FocusPlus = "Lens~Focus +", FocusMinus = "Lens~Focus -",
+    ZoomPlus = "Lens~Zoom +", ZoomMinus = "Lens~Zoom -",
+    DetailText = "Diagnostics~Detail", Diag1 = "Diagnostics~ERRS1", Diag2 = "Diagnostics~ERRS2",
+    LastResponse = "Diagnostics~Last Reply",
+  }
 
+  -- Panel width 500px: boxes at x=5, w=490, 5px grid.
   local function box(title, x, y, w, h)
     graphics[#graphics + 1] = {
-      Type = "GroupBox", Text = title, Fill = { 52, 56, 64 }, StrokeColor = { 90, 96, 108 },
-      StrokeWidth = 1, CornerRadius = 6, HTextAlign = "Left", Position = { x, y }, Size = { w, h },
+      Type = "GroupBox", Text = title, Fill = { 195, 195, 195 }, StrokeWidth = 2,
+      StrokeColor = { 0, 210, 255 }, CornerRadius = 8, Position = { x, y }, Size = { w, h },
     }
   end
   local function label(title, x, y, w)
     graphics[#graphics + 1] = {
-      Type = "Text", Text = title, Position = { x, y }, Size = { w, 18 }, FontSize = 12,
-      HTextAlign = "Right", Color = WHITE,
+      Type = "Text", Text = title, Position = { x, y }, Size = { w, 20 }, FontSize = 11,
+      HTextAlign = "Right", Color = TEXT,
     }
   end
   local function control(name, style, x, y, w, h, extra)
-    local c = { PrettyName = name, Style = style, Position = { x, y }, Size = { w, h }, FontSize = 12 }
+    local c = { PrettyName = PRETTY[name] or name, Style = style, Position = { x, y }, Size = { w, h }, FontSize = 12 }
     for k, v in pairs(extra or {}) do c[k] = v end
     layout[name] = c
   end
-  local function button(name, legend, x, y, w, h)
-    control(name, "Button", x, y, w, h, { Legend = legend })
+  local function button(name, legend, x, y, w, h, color)
+    control(name, "Button", x, y, w, h, { Legend = legend, Color = color })
   end
 
   -- Connection
-  box("Connection", 5, 5, 430, 110)
-  label("Model", 15, 30, 85)
-  control("Model", "Text", 105, 28, 160, 22)
-  label("Connected", 275, 30, 85)
-  control("Connected", "Led", 365, 28, 22, 22)
-  label("IP Address", 15, 58, 85)
-  control("IPAddress", "Text", 105, 56, 160, 22)
-  label("Status", 15, 86, 85)
-  control("Status", "Text", 105, 84, 320, 22)
+  box("Connection", 5, 5, 490, 110)
+  label("Model:", 10, 30, 75)
+  control("Model", "Text", 90, 28, 195, 22)
+  label("Connected:", 295, 30, 75)
+  control("Connected", "Led", 375, 28, 22, 22)
+  label("IP Address:", 10, 58, 75)
+  control("IPAddress", "Text", 90, 56, 195, 22)
+  label("Status:", 10, 86, 75)
+  control("Status", "Text", 90, 84, 390, 22)
 
   -- Power
-  box("Power", 5, 120, 430, 60)
-  button("PowerOn", "On", 15, 145, 90, 28)
-  button("PowerOff", "Off", 110, 145, 90, 28)
-  control("PowerState", "Led", 215, 148, 22, 22)
-  control("PowerText", "Text", 242, 148, 100, 22)
+  box("Power", 5, 120, 490, 60)
+  button("PowerOn", "Power On", 10, 145, 130, 28, { 0, 200, 220 })
+  button("PowerOff", "Power Off", 145, 145, 130, 28, { 255, 140, 0 })
+  control("PowerState", "Led", 290, 148, 22, 22)
+  control("PowerText", "Text", 317, 148, 140, 22)
 
   -- Input
-  box("Input", 5, 185, 430, 55)
-  control("Input", "ComboBox", 15, 210, 250, 24)
+  box("Input", 5, 185, 490, 55)
+  control("Input", "ComboBox", 10, 210, 250, 24)
 
   -- Image
-  box("Image", 5, 245, 430, 55)
-  button("Shutter", "Shutter", 15, 270, 120, 26)
-  layout["Shutter"].PrettyName = "Shutter (Image Mute)"
-  button("Freeze", "Freeze", 140, 270, 120, 26)
+  box("Image", 5, 245, 490, 55)
+  button("Shutter", "Shutter", 10, 270, 130, 26)
+  button("Freeze", "Freeze", 145, 270, 130, 26)
 
   -- Menu navigation
-  box("Menu", 5, 305, 205, 130)
+  box("Menu", 5, 305, 240, 130)
   button("Menu", "Menu", 15, 330, 60, 28)
   button("Up", "Up", 80, 330, 60, 28)
   button("Default", "Default", 145, 330, 60, 28)
@@ -1160,32 +1208,32 @@ function GetControlLayout(props)
   if m.Features.AutoSetup then button("AutoSetup", "Auto Setup", 145, 394, 60, 28) end
 
   -- Lens
-  box("Lens", 215, 305, 220, 130)
+  box("Lens", 250, 305, 245, 130)
   if m.Features.LensShift then
-    button("LensShiftUp", "Up", 266, 330, 42, 28)
-    button("LensShiftLeft", "Left", 222, 362, 42, 28)
-    button("LensShiftRight", "Right", 310, 362, 42, 28)
-    button("LensShiftDown", "Down", 266, 394, 42, 28)
+    button("LensShiftUp", "Up", 301, 330, 42, 28)
+    button("LensShiftLeft", "Left", 257, 362, 42, 28)
+    button("LensShiftRight", "Right", 345, 362, 42, 28)
+    button("LensShiftDown", "Down", 301, 394, 42, 28)
   end
   if m.Features.Focus then
-    button("FocusPlus", "Foc +", 358, 330, 34, 28)
-    button("FocusMinus", "Foc -", 394, 330, 34, 28)
+    button("FocusPlus", "Foc +", 400, 330, 40, 28)
+    button("FocusMinus", "Foc -", 445, 330, 40, 28)
   end
   if m.Features.Zoom then
-    button("ZoomPlus", "Zm +", 358, 362, 34, 28)
-    button("ZoomMinus", "Zm -", 394, 362, 34, 28)
+    button("ZoomPlus", "Zm +", 400, 362, 40, 28)
+    button("ZoomMinus", "Zm -", 445, 362, 40, 28)
   end
 
   -- Diagnostics
-  box("Diagnostics", 5, 440, 430, 125)
-  label("Detail", 15, 465, 80)
-  control("DetailText", "Text", 100, 463, 325, 22)
-  label("ERRS1", 15, 491, 80)
-  control("Diag1", "Text", 100, 489, 325, 22)
-  label("ERRS2", 15, 517, 80)
-  control("Diag2", "Text", 100, 515, 325, 22)
-  label("Last reply", 15, 543, 80)
-  control("LastResponse", "Text", 100, 541, 325, 22)
+  box("Diagnostics", 5, 440, 490, 125)
+  label("Detail:", 10, 465, 75)
+  control("DetailText", "Text", 90, 463, 390, 22)
+  label("ERRS1:", 10, 491, 75)
+  control("Diag1", "Text", 90, 489, 390, 22)
+  label("ERRS2:", 10, 517, 75)
+  control("Diag2", "Text", 90, 515, 390, 22)
+  label("Last Reply:", 10, 543, 75)
+  control("LastResponse", "Text", 90, 541, 390, 22)
 
   return layout, graphics
 end

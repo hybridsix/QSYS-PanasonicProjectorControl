@@ -1,10 +1,90 @@
-# Q-SYS Panasonic Projector Control
+# Panasonic Projector Control - Q-SYS Plugin
 
-Q-SYS Designer plugin for Panasonic **PT-REQ80** and **PT-RQ35K2** projectors, using Panasonic's LAN command protocol (TCP, default port 1024). Targets Q-SYS Designer 10.5.
+**Author:** Michael King / Hybridsix  **Version:** 0.1.0  **Platform:** Q-SYS Designer 10.5, Panasonic PT-REQ80 / PT-RQ35K2
 
-## Install
+A Q-SYS plugin that gives your Core direct control over a Panasonic PT-REQ80 or PT-RQ35K2 projector on the local network - power, input, shutter, freeze, menu, lens, and live status, all from the schematic.
 
-Download [PanasonicProjectorControl.qplug](https://github.com/hybridsix/QSYS-PanasonicProjectorControl/releases/latest/download/PanasonicProjectorControl.qplug) (latest [release](https://github.com/hybridsix/QSYS-PanasonicProjectorControl/releases/latest)) and copy it to `%USERPROFILE%\Documents\QSC\Q-SYS Designer\Plugins\`. Restart Designer. The plugin appears under **Panasonic > Projector Control**.
+## Features
+
+- Power on / off with live power state feedback
+- Input selection (model-specific list; optional slot-board and SDM inputs can be enabled in Properties)
+- Shutter (image mute) and Freeze
+- Menu navigation: Menu, Up, Down, Left, Right, Enter, Default
+- Lens shift, focus and zoom (model-dependent), with a configurable lens speed
+- Auto Setup (PT-RQ35K2 only)
+- Live status polling - connection, power, input, shutter and freeze are kept in sync with the projector
+- Automatic reconnect if the projector or network drops
+- Raw `ERRS1` / `ERRS2` diagnostic readout for commissioning
+
+## How it works
+
+```
+Q-SYS Core  ---- TCP :1024 ---->  Projector
+            <--- replies, state --
+```
+
+The plugin opens one TCP connection to the projector and talks Panasonic's LAN command protocol. All control handlers only queue a request; a single engine sends one request at a time, parses the reply, and updates the controls from what the projector actually reports. Polling is conservative and driven by power state.
+
+## Requirements
+
+Q-SYS Core side:
+
+- Q-SYS Designer 10.5
+- Core must be able to reach the projector on TCP port 1024 (same LAN or routed)
+
+Projector side:
+
+- Panasonic PT-REQ80 or PT-RQ35K2
+- LAN control enabled on the projector
+- Command protect (authentication) disabled - see **Not in version 1**
+
+## Installation
+
+### 1. Q-SYS Designer setup
+
+1. Download [PanasonicProjectorControl.qplug](https://github.com/hybridsix/QSYS-PanasonicProjectorControl/releases/latest/download/PanasonicProjectorControl.qplug) from the latest [release](https://github.com/hybridsix/QSYS-PanasonicProjectorControl/releases/latest)
+2. Copy it to: `%USERPROFILE%\Documents\QSC\Q-Sys Designer\Plugins\QSYS Panasonic Projector Control\`
+3. Restart Q-SYS Designer (or use Manage Plugins to reload)
+4. Drag Hybridsix Software -> Panasonic Projector Control from the component library onto your schematic
+5. Open the plugin's Properties panel and fill in:
+
+| Property | Description |
+|---|---|
+| Model | PT-REQ80 or PT-RQ35K2 |
+| IP Address | The projector's IP address |
+| Port | Must match the projector's command port (default 1024) |
+| Lens Speed | Slow / Normal / Fast |
+| Optional inputs | One switch per optional input for the selected model |
+| Debug Print | None / Tx/Rx / All - use Tx/Rx when commissioning |
+
+## Controls and pins
+
+All pins are available in the Control Pins section of the Properties panel.
+
+| Control | Direction | Type | Description |
+|---|---|---|---|
+| Power On / Power Off | Input | Button | Power the projector on / off |
+| Power State | Output | LED | true when the projector is on |
+| Power State Text | Output | Text | Current power state |
+| Input | Both | Combo box | Select / report the active input |
+| Shutter (Image Mute) | Both | Toggle button | true = shutter engaged, image blanked (`OSH:1`); false = image visible (`OSH:0`) |
+| Freeze | Both | Toggle button | Freeze the image |
+| Menu, Up, Down, Left, Right, Enter, Default | Input | Button | Projector menu navigation |
+| Auto Setup | Input | Button | PT-RQ35K2 only |
+| Lens Shift, Focus, Zoom | Input | Momentary button | Lens control (model-dependent) |
+| Connected | Output | LED | true when the projector is reachable |
+| Status | Output | Status | Connection state |
+| Model, IP Address | Output | Text | What this block is talking to |
+| Detail, ERRS1, ERRS2, Last Reply | Output | Text | Diagnostics |
+
+## Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| Status never reaches Connected | Ping the projector from another device. Check the IP Address and Port properties. Confirm LAN control is enabled on the projector. |
+| Status shows a command-protect message | Command protect (authentication) is enabled on the projector. Disable it; authentication is not supported yet. |
+| Commands are ignored or time out | Set Debug Print to Tx/Rx and compare the traffic with the projector's documentation. |
+| Lens moves the wrong way | Direction is not yet verified on hardware - see **Not yet verified on a real projector**. |
 
 ## Build from source
 
@@ -14,9 +94,9 @@ npm run build      # writes dist/PanasonicProjectorControl.qplug
 npm test           # builds, then runs the Lua tests
 ```
 
-## Layout
+## File reference
 
-| Path | Purpose |
+| File | Purpose |
 |---|---|
 | `src/info.lua` | `PluginInfo` (version injected from `package.json`) |
 | `src/plugin.lua` | Design-time: properties, controls, layout, pages |
@@ -54,3 +134,7 @@ Settle these in the lab; each is isolated so the fix is local.
 - **Command protect authentication.** The projector must have command protect disabled. If it is on, the plugin shows a clear status and retries every 30 seconds.
 - **`ERRS1` / `ERRS2` decoding.** Raw replies are shown; no Warning/Fault indicator is derived until Panasonic's error tables are validated.
 - Absolute lens positions, lens memory, picture modes, Active Focus Optimizer, REQ80 periphery focus, projector images/icons.
+
+## License
+
+MIT - see repository for details.
