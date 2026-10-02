@@ -158,7 +158,3 @@ Settle these in the lab; each is isolated so the fix is local.
 - **Command protect authentication.** The projector must have command protect disabled. If it is on, the plugin shows a clear status and retries every 30 seconds.
 - **`ERRS1` / `ERRS2` decoding.** Raw replies are shown; no Warning/Fault indicator is derived until Panasonic's error tables are validated.
 - Absolute lens positions, lens memory, picture modes, Active Focus Optimizer, REQ80 periphery focus, projector images/icons.
-
-## License
-
-MIT - see repository for details.
