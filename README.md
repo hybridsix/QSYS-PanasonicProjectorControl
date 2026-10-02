@@ -2,15 +2,17 @@
 
 Q-SYS Designer plugin for Panasonic **PT-REQ80** and **PT-RQ35K2** projectors, using Panasonic's LAN command protocol (TCP, default port 1024). Targets Q-SYS Designer 10.5.
 
-## Build and install
+## Install
+
+Download [PanasonicProjectorControl.qplug](https://github.com/hybridsix/QSYS-PanasonicProjectorControl/releases/latest/download/PanasonicProjectorControl.qplug) (latest [release](https://github.com/hybridsix/QSYS-PanasonicProjectorControl/releases/latest)) and copy it to `%USERPROFILE%\Documents\QSC\Q-SYS Designer\Plugins\`. Restart Designer. The plugin appears under **Panasonic > Projector Control**.
+
+## Build from source
 
 ```powershell
 npm install        # once; installs the Lua test VM (fengari)
 npm run build      # writes dist/PanasonicProjectorControl.qplug
 npm test           # builds, then runs the Lua tests
 ```
-
-Copy `dist/PanasonicProjectorControl.qplug` to `%USERPROFILE%\Documents\QSC\Q-SYS Designer\Plugins\` and restart Designer. The plugin appears under **Panasonic > Projector Control**.
 
 ## Layout
 
