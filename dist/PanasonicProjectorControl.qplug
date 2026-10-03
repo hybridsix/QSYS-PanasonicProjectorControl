@@ -14,9 +14,9 @@
 -- =============================================================
 
 PluginInfo = {
-  Name = "Hybridsix Software~Panasonic Projector Control",
-  Version = "0.1.5",
-  BuildVersion = "0.1.5.0",
+  Name = "Displays~Projectors~Panasonic~Projector Control",
+  Version = "0.1.6",
+  BuildVersion = "0.1.6.0",
   Id = "eb89b070-8e63-4d3d-a30a-2234f9da3fc9",
   Author = "Michael King",
   Description = "Control Panasonic PT-REQ80 and PT-RQ35K2 projectors from Q-SYS: power, input, shutter, freeze, menu and lens control over Panasonic LAN command control (TCP), with live status feedback.",
@@ -1287,15 +1287,27 @@ function GetColor(props)
   return { 0, 210, 255 }
 end
 
+-- Device name from the Name property (e.g. "PRJ-201"); spaces become
+-- non-breaking so the block face does not word-wrap it.
+local function deviceName(props, default)
+  local p = props["Name"]
+  local name = p and p.Value or ""
+  if name:match("^%s*$") then return default end
+  return (name:gsub(" ", "\xC2\xA0"))
+end
+
 -- Block face label. Non-breaking spaces (U+00A0) stop Q-SYS from
--- word-wrapping the title. The selected model is shown underneath.
+-- word-wrapping the title. The Name property replaces the title when set;
+-- the selected model is shown underneath.
 function GetPrettyName(props)
   local nbsp = "\xC2\xA0"
-  return "Projector" .. nbsp .. "Control" .. "\n" .. modelOf(props).Name
+  local title = "Projector" .. nbsp .. "Control"
+  return deviceName(props, title) .. "\n" .. modelOf(props).Name
 end
 
 function GetProperties()
   local props = {
+    { Name = "Name", Type = "string", Value = "" },
     { Name = "Model", Type = "enum", Choices = Models.Ids, Value = Models.Default },
     { Name = "IP Address", Type = "string", Value = "192.168.10.100" },
     { Name = "Port", Type = "integer", Min = 1, Max = 65535, Value = 1024 },
