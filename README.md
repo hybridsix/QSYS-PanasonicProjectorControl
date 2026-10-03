@@ -1,6 +1,6 @@
 # Panasonic Projector Control - Q-SYS Plugin
 
-**Author:** Michael King / Hybridsix  **Version:** 0.1.7  **Platform:** Q-SYS Designer 10.5, Panasonic PT-REQ80 / PT-RQ35K2
+**Author:** Michael King / Hybridsix  **Version:** 0.1.8  **Platform:** Q-SYS Designer 10.5, Panasonic PT-REQ80 / PT-RQ35K2
 
 A Q-SYS plugin that gives your Core direct control over a Panasonic PT-REQ80 or PT-RQ35K2 projector on the local network - power, input, shutter, freeze, menu, lens, and live status, all from the schematic.
 

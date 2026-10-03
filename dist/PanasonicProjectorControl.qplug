@@ -15,8 +15,8 @@
 
 PluginInfo = {
   Name = "Hybridsix Software~Projectors~Panasonic~Projector Control",
-  Version = "0.1.7",
-  BuildVersion = "0.1.7.0",
+  Version = "0.1.8",
+  BuildVersion = "0.1.8.0",
   Id = "eb89b070-8e63-4d3d-a30a-2234f9da3fc9",
   Author = "Michael King",
   Description = "Control Panasonic PT-REQ80 and PT-RQ35K2 projectors from Q-SYS: power, input, shutter, freeze, menu and lens control over Panasonic LAN command control (TCP), with live status feedback.",
@@ -1296,13 +1296,18 @@ local function deviceName(props, default)
   return (name:gsub(" ", "\xC2\xA0"))
 end
 
+-- Keeps a label on one line: spaces become non-breaking and hyphens become
+-- non-breaking hyphens (U+2011), which Q-SYS would otherwise wrap at.
+local function noBreak(s)
+  return (s:gsub(" ", "\xC2\xA0"):gsub("-", "\xE2\x80\x91"))
+end
 -- Block face label. Non-breaking spaces (U+00A0) stop Q-SYS from
 -- word-wrapping the title. The Name property replaces the title when set;
 -- the selected model is shown underneath.
 function GetPrettyName(props)
   local nbsp = "\xC2\xA0"
   local title = "Projector" .. nbsp .. "Control"
-  return deviceName(props, title) .. "\n" .. modelOf(props).Name
+  return deviceName(props, title) .. "\n" .. noBreak(modelOf(props).Name)
 end
 
 function GetProperties()

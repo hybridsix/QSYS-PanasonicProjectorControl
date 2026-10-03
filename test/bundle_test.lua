@@ -82,7 +82,7 @@ for _, model in ipairs({ "PT-REQ80", "PT-RQ35K2" }) do
     end
     T.truthy(#graphics > 0)
     T.eq(#GetPages(props), 1)
-    T.truthy(GetPrettyName(props):find(model, 1, true))
+    T.truthy(GetPrettyName(props):find((model:gsub("-", "\xE2\x80\x91")), 1, true))
   end)
 end
 
