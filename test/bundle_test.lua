@@ -23,7 +23,7 @@ local function propsFromDefaults(overrides)
 end
 
 T.test("PluginInfo is complete", function()
-  T.eq(PluginInfo.Name, "Displays~Projectors~Panasonic~Projector Control")
+  T.eq(PluginInfo.Name, "Hybridsix Software~Projectors~Panasonic~Projector Control")
   T.truthy(PluginInfo.Id:match("^%x+%-%x+%-%x+%-%x+%-%x+$"))
   T.truthy(PluginInfo.Version:match("^%d+%.%d+%.%d+$"), "version placeholder not replaced")
 end)

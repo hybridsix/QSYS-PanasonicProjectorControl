@@ -14,7 +14,7 @@
 -- =============================================================
 
 PluginInfo = {
-  Name = "Displays~Projectors~Panasonic~Projector Control",
+  Name = "Hybridsix Software~Projectors~Panasonic~Projector Control",
   Version = "@VERSION@",
   BuildVersion = "@VERSION@.0",
   Id = "eb89b070-8e63-4d3d-a30a-2234f9da3fc9",
